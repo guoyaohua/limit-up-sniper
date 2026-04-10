@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+logs/
+*.log
+
+# Output data (generated at runtime)
+output/
+reports/
+temp/
+
+# QMT / XTQuant
+userdata_mini/
+
+# Environment
+.env
+.env.*
+venv/
+.venv/
+
+# Data backups
+data_backup/
+*.feather
+*.pkl
+
+# WebDriver
+msedgedriver.exe
+
+# Jupyter
+.ipynb_checkpoints/

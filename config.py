@@ -1,0 +1,129 @@
+"""
+config.py - 打板策略全局配置
+
+所有策略参数、交易账户配置、阈值常量集中管理。
+"""
+
+import os
+from datetime import datetime, time as dt_time
+
+from infra.common_enums import PreMarketSellStrategy
+
+# ---------------------------------------------------------------------------- #
+#                                     全局变量                                  #
+# ---------------------------------------------------------------------------- #
+VERSION = 'v2.4'
+DEBUG_MODE = False
+ENABLE_SHADOW_SIGNAL = False  # 影子信号模式：不真实下单，而是使用与实盘相同的策略只发出交易信号，用于复盘用。
+IS_LIVE_TRADING = not DEBUG_MODE  # 是否为实盘交易模式
+
+# 板块数据源配置: 'THS' (同花顺) 或 'EM' (东方财富)，默认使用THS
+SECTOR_DATA_SOURCE = 'THS'
+
+STRATEGY_NAME = f'FirstLimitUp_{VERSION}_Debug' if DEBUG_MODE else f'FirstLimitUp_{VERSION}'  # 不要出现中文，以免FTP目录出现乱码
+SHOULD_DOWNLOAD_KLINE = True
+
+if IS_LIVE_TRADING:
+    # !!! 中金模拟端配置 !!! 注意 这是实盘 !!!
+    CLIENT_PATH = '<redacted-qmt-path>'
+    STOCK_ACCOUNT = '<redacted-account>'
+else:
+    # 国金模拟端配置 1
+    CLIENT_PATH = '<redacted-qmt-path>'
+    STOCK_ACCOUNT = '<redacted-account>'
+
+# 使用实盘数据源
+IP = '127.0.0.1'
+PORT = 58610
+
+# # 国金模拟端配置 2
+# CLIENT_PATH = '<redacted-qmt-path>'
+# STOCK_ACCOUNT = '<redacted-account>'
+
+# # 中金模拟端配置
+# CLIENT_PATH = '<redacted-qmt-path>'
+# STOCK_ACCOUNT = '<redacted-account>'
+
+# ---------------------------------------------------------------------------- #
+
+STOP_TIME = dt_time(15, 1) if not DEBUG_MODE else dt_time(23, 59)  # 停止时间
+CLEAR_TIME = dt_time(14, 50) if not DEBUG_MODE else dt_time(23, 59)  # 清仓时间
+BUY_ORDER_CANCEL_DEADLINE = dt_time(14, 55) if not DEBUG_MODE else dt_time(
+    23, 59)  # 尾盘撤买时间
+SELL_ORDER_CANCEL_DEADLINE = dt_time(14, 50) if not DEBUG_MODE else dt_time(
+    23, 59)  # 尾盘撤卖时间
+TODAY = datetime.now().strftime('%Y%m%d')
+# TODAY = '20250722'
+
+# 最大持仓数量
+MAX_HOLDING_COUNT = 6
+MAX_SAME_SECTOR_COUNT = 2  # v3.0: 同一概念板块最多持有2只，防止板块集中风险
+
+LATENCY_THRESHOLD = 20  # 延迟阈值(s)
+MONITOR_LOG_PATH = os.path.join(rf"F:\output\QMT\monitor\v{VERSION}",
+                                datetime.today().strftime("%Y-%m-%d-%H%M%S"))
+MONITOR_INTERVAL = 1  # 监控间隔(s)
+STOCK_TO_CONCEPT_MAPPING_FILE = r"output\concept_sector_data\THS\stock_to_concept_mapping.json" if SECTOR_DATA_SOURCE == 'THS' else r"output\concept_sector_data\stock_to_concept_mapping.json"  # 概念板块映射文件
+STOCK_TO_INDUSTRY_MAPPING_FILE = r"output\industry_sector_data\THS\stock_to_industry_mapping.json" if SECTOR_DATA_SOURCE == 'THS' else r"output\industry_sector_data\stock_to_industry_mapping.json"  # 行业板块映射文件
+
+# ---------------------------------------------------------------------------- #
+MAX_UP_LIMIT_BREAK_COUNT = 5  # 最大涨停炸板次数
+MAX_UP_LIMIT_BREAK_TIME = 1200  # 最大涨停炸板时间间隔(s)
+
+MAX_TURNOVER_RATE_THRESHOLD = 15  # 最大换手率阈值，超过则加入观察名单
+MAX_TURNOVER_RATE_BLACKLIST = 25  # 换手率直接拉黑阈值（U5升级）
+WATCHLIST_POSITION_RATIO = 0.5  # 观察名单仓位缩减比例（U5升级）
+WATCHLIST_RELEASE_MINUTES = 30  # 观察名单自动解除时间（分钟）
+WATCHLIST_RELEASE_TURNOVER = 12  # 观察名单解除换手率阈值（%）
+MIN_TURNOVER_RATE_THRESHOLD = 3  # 换手率最低阈值
+
+MIN_VOLUME_RATIO_THRESHOLD = 0.7  # 最小成交量比率阈值
+
+STOP_LOSS_RATE = 0.05  # 止损率，跌破止损价则卖出
+MAX_CANCEL_COUNT = 25  # 最大撤单次数，超过则不再排板买入
+
+# U6升级：波动率加权仓位管理
+VOLATILITY_TARGET = 0.05  # 目标振幅（5%），振幅高于此则降低仓位，低于此则增加仓位
+VOLATILITY_RATIO_MIN = 0.5  # 仓位调整最小倍数
+VOLATILITY_RATIO_MAX = 1.5  # 仓位调整最大倍数
+
+FIRST_LIMIT_TIME_CUTOFF = '14:30'  # 首次涨停时间截止点，超过则不扫首封板
+
+# U7升级：LLM 盘前板块预判
+ENABLE_PRE_MARKET_LLM_ANALYSIS = True  # 是否启用盘前LLM分析
+LLM_SECTOR_PRIORITY_DISCOUNT = 0.3  # LLM优先板块最多降低封单门槛30%
+
+MIN_LIMIT_ORDER_AMOUNT = 2e7  # 最小封单金额(元) - 低于此值不参与
+
+# 封单金额阈值配置（基于市场情绪）
+LIMIT_ORDER_AMOUNT_THRESHOLDS = {
+    'STRONG_8': 3e7,      # 市场极强(>=8): 封单额>=3000万即可买入
+    'STRONG_7': 5e7,      # 市场强势(>=7): 封单额>=5000万
+    'NEUTRAL_55': 8e7,    # 中性偏强(>=5.5): 封单额>=8000万
+    'NEUTRAL_4': 1e8,     # 中性(>=4): 封单额>=1亿
+    'WEAK_25': 1.5e8,     # 弱势(>=2.5): 封单额>=1.5亿
+}
+
+# ---------------------------------------------------------------------------- #
+#                              盘前卖出策略配置                                  #
+# ---------------------------------------------------------------------------- #
+
+PRE_MARKET_SELL_STRATEGY = PreMarketSellStrategy.FIXED_PREMIUM_SELL
+FIXED_PREMIUM_RATE = 0.02  # 默认2%
+
+# ---------------------------------------------------------------------------- #
+#                              日内分档止盈配置 (v3.0)                           #
+# ---------------------------------------------------------------------------- #
+INTRADAY_TAKE_PROFIT_ENABLED = True
+INTRADAY_TAKE_PROFIT_TIERS = [
+    # (盈利比例, 卖出比例, 说明)
+    (0.05, 0.25, '盈利5%卖出1/4'),
+    (0.08, 0.25, '盈利8%再卖1/4'),
+    (0.10, 0.25, '盈利10%再卖1/4'),
+    # 剩余1/4跟随追踪止损
+]
+
+# ---------------------------------------------------------------------------- #
+#                                 U8升级：交易日志                               #
+# ---------------------------------------------------------------------------- #
+TRADE_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output', 'trade_logs')

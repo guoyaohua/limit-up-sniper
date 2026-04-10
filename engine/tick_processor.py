@@ -1,0 +1,697 @@
+"""
+engine/tick_processor.py - Tick 数据处理与全推行情订阅
+
+从 打板策略_v2.4.py 提取的 on_data 回调、process_tick_data 处理循环、
+check_order_successed 模拟成交判断、create_whole_quote_task 订阅任务。
+"""
+
+import time
+import traceback
+import numpy as np
+from queue import Empty
+from functools import partial
+from multiprocessing import current_process, Value
+from datetime import datetime, time as dt_time
+from loguru import logger
+from xtquant import xtconstant
+
+from config import (
+    STOP_TIME, STRATEGY_NAME, DEBUG_MODE,
+    LATENCY_THRESHOLD,
+    MAX_UP_LIMIT_BREAK_COUNT, MAX_UP_LIMIT_BREAK_TIME,
+    MAX_CANCEL_COUNT,
+)
+from infra.common_enums import (
+    OrderType, StockOrderStatusInt, StockLimitStatusInt,
+)
+from infra.utils import send_email
+from infra.data_helpers import (
+    is_trading_time, _calc_delay_time, _check_same_price,
+    _calc_limit_up_break_duration,
+)
+from infra.task_manager import CallbackHeartbeatMonitor
+from core.decisions import should_buy, should_cancel, should_sell
+from core.trailing_stop import calculate_trailing_stop_prices
+
+
+# 全局回调心跳监控器（用于监控 xtdata 回调是否正常）
+_callback_heartbeat_monitor = None
+
+
+def get_callback_heartbeat_monitor(
+        timeout: float = 30) -> CallbackHeartbeatMonitor:
+    """获取全局回调心跳监控器实例"""
+    global _callback_heartbeat_monitor
+    if _callback_heartbeat_monitor is None:
+        _callback_heartbeat_monitor = CallbackHeartbeatMonitor(
+            name="xtdata_whole_quote_callback", timeout=timeout)
+    return _callback_heartbeat_monitor
+
+
+# ---------------------------------------------------------------------------- #
+#                               on_data 回调函数                                #
+# ---------------------------------------------------------------------------- #
+
+def on_data(datas,
+            tick_queue,
+            shadow_tick_queue,
+            stock_info_dict,
+            stop_flag,
+            heartbeat_monitor=None):
+    """分笔行情回调函数
+
+    tick - 分笔数据
+        'time'                  #时间戳
+        'lastPrice'             #最新价
+        'open'                  #开盘价
+        'high'                  #最高价
+        'low'                   #最低价
+        'lastClose'             #前收盘价
+        'amount'                #成交总额
+        'volume'                #成交总量
+        'pvolume'               #原始成交总量
+        'stockStatus'           #证券状态
+        'openInt'               #持仓量
+        'lastSettlementPrice'   #前结算
+        'askPrice'              #委卖价
+        'bidPrice'              #委买价
+        'askVol'                #委卖量
+        'bidVol'                #委买量
+        'transactionNum'        #成交笔数
+
+    Args:
+        datas: tick数据字典
+        tick_queue: tick数据队列
+        shadow_tick_queue: 影子模式tick数据队列
+        stock_info_dict: 股票信息字典
+        stop_flag: 停止标志
+        heartbeat_monitor: 回调心跳监控器（可选）
+    """
+    try:
+        # 更新心跳（如果有监控器）
+        if heartbeat_monitor is not None:
+            heartbeat_monitor.update()
+
+        tick_queue.put(datas)
+        if shadow_tick_queue:
+            shadow_tick_queue.put(datas)
+
+        # 记录日志
+        stock_code = list(datas.keys())[0]
+        time_now = datetime.now().strftime('%H:%M')
+        latency = _calc_delay_time(datas[stock_code]['time'])
+        queue_size = tick_queue.qsize()
+        msg = f'【回调】【Tick】延迟：{latency}s，数据大小：{len(datas)}，队列大小：{queue_size}'
+        logger.debug(msg)
+
+        if latency > LATENCY_THRESHOLD and (
+            (time_now > '09:31' and time_now < '11:30') or
+            (time_now > '13:00' and time_now < '14:57')):
+            msg = f'【回调】【Tick】{stock_code} {stock_info_dict[stock_code]["股票名称"]} 延迟：{latency}s, 超过阈值{LATENCY_THRESHOLD}s, 重新订阅'
+            logger.error(msg)
+            stop_flag.value = True
+
+    except Exception as e:
+        logger.exception(
+            f'【关键错误】Tick数据处理失败：{e}, 数据大小：{len(datas) if datas else 0}')
+        # 记录错误到心跳监控器
+        if heartbeat_monitor is not None:
+            heartbeat_monitor.record_error()
+
+
+# ---------------------------------------------------------------------------- #
+#                             模拟成交判断                                       #
+# ---------------------------------------------------------------------------- #
+
+def check_order_successed(shared_data,
+                          stock_code,
+                          tick_data,
+                          is_limit_up,
+                          strong_stocks=None,
+                          order_status=None,
+                          stock_status=None):
+    """检查是否成交"""
+    # 性能优化：使用缓存的数据引用
+    if strong_stocks is None:
+        strong_stocks = shared_data['强势股票']
+    if order_status is None:
+        order_status = shared_data['委托状态']
+    if stock_status is None:
+        stock_status = shared_data['股票状态信号'][stock_code]
+
+    if stock_code not in strong_stocks:
+        return False
+
+    if stock_code not in order_status.keys():
+        return False
+
+    if not is_limit_up:
+        # 如果开板则认为成交
+        logger.warning(f'[模拟] {stock_code} 开板状态，认为成交')
+        return True
+
+    with stock_status['下单时成交量'].get_lock():
+        volume_diff = tick_data['volume'] - stock_status['下单时成交量'].value
+
+    with stock_status['下单时封单量'].get_lock():
+        bid_vol = stock_status['下单时封单量'].value
+        bid_vol_diff = bid_vol - tick_data['bidVol'][0]
+
+    if bid_vol_diff < 0:
+        if volume_diff >= bid_vol:
+            # 封板量增加, 且成交量增加大于等于封板量，认为成交
+            logger.warning(
+                f'[模拟] {stock_code} 封板量增加, 且成交量增加 {volume_diff} >= 下单时封单量 {bid_vol}，认为成交'
+            )
+            return True
+    else:
+        if volume_diff + bid_vol_diff >= bid_vol:
+            # 封板量减少, 且成交量增加加上封板量减少大于等于封板量，认为成交 （不准确，只能大概）
+            logger.warning(
+                f'[模拟] {stock_code} 封板量减少, 且成交量增加 {volume_diff} + 封单量减少 {bid_vol_diff} >= 下单时封单量 {bid_vol}，认为成交'
+            )
+            return True
+
+    logger.info(f'[模拟] {stock_code} 目前未成交')
+
+    return False
+
+
+# ---------------------------------------------------------------------------- #
+#                           process_tick_data 处理循环                           #
+# ---------------------------------------------------------------------------- #
+
+def process_tick_data(shared_data,
+                      tick_queue,
+                      order_queue,
+                      shadow_signal_mode=False):
+    '''全推行情数据处理函数，分笔数据
+    '''
+
+    logger.info('开启处理tick数据进程')
+
+    # 性能优化：缓存常用数据引用，减少字典查找开销
+    stock_info_dict = shared_data['股票信息']
+    stock_status_signals = shared_data['股票状态信号']
+    market_sentiment_score = shared_data['市场情绪_评分']
+    limit_up_pool = shared_data['涨停池']
+    break_pool = shared_data['炸板池']
+    blacklist = shared_data['黑名单']
+    strong_stocks = shared_data['强势股票']
+    concept_sector_effect = shared_data['概念板块效应']
+    industry_sector_effect = shared_data['行业板块效应']
+    individual_capital_inflow = shared_data['个股资金流入']
+    holding_status = shared_data['持仓状态']
+    cancel_count = shared_data['撤单次数']
+    break_count = shared_data['开板次数']
+    max_break_time = shared_data['最大开板回封时间']
+    pre_market_holdings = shared_data['盘前持仓']
+    order_status = shared_data['委托状态']
+
+    while True:
+        try:
+            start_time = time.time()
+            datas = tick_queue.get(timeout=1)
+
+            # 丢弃每次订阅时传递的旧tick数据
+            if not is_trading_time():
+                logger.info(f"当前不在交易时间，跳过当前tick数据。{datas}")
+                continue
+
+            # 处理tick数据
+            for stock_code in datas:
+                order = {}
+                data = datas[stock_code]
+
+                # 性能优化：使用缓存版本的时间转换
+                # time_now = _conv_time_cached(data['time'], fmt='%H:%M')
+
+                # 缓存单只股票的常用信息，减少重复查找
+                stock_info = stock_info_dict[stock_code]
+                stock_status = stock_status_signals[stock_code]
+                limit_up_price = stock_info["涨停价"]
+                down_limit_price = stock_info["跌停价"]
+                is_near_limit_up = False
+                is_limit_up = False
+                is_down_limit = False
+                # 去除集合竞价时间
+                if data.get('openInt', 0) != 13 and data.get('openInt',
+                                                             0) != 15:
+                    # 跳过集合竞价
+                    logger.info(f'跳过集合竞价，{data}')
+                    continue
+                else:
+                    # 性能优化：使用缓存的价格比较函数和预先缓存的价格
+                    # 涨停状态, 真实封板, 买一价为涨停价
+                    is_limit_up = _check_same_price(data['bidPrice'][0],
+                                                    limit_up_price)
+
+                    # 触及涨停价，委卖价格不为空，且最大委卖价格等于涨停价，卖一价格为涨停价
+                    is_near_limit_up = (not is_limit_up and data['askPrice']
+                                        and _check_same_price(
+                                            data['askPrice'][0],
+                                            limit_up_price))
+
+                    is_down_limit = (not is_limit_up and data['askPrice']
+                                     and _check_same_price(
+                                         data['askPrice'][0],
+                                         down_limit_price))
+
+                    # ---------------------------------- 更新股票状态 --------------------------------- #
+                    if is_limit_up:
+                        # 1. 维持涨停
+                        with stock_status['股票状态'].get_lock():
+                            current_stock_status = stock_status['股票状态'].value
+                        if current_stock_status == StockLimitStatusInt.LIMIT_UP:
+                            # 已经是涨停状态，仅更新封单金额
+                            # 封单金额
+                            limit_up_amount = data['bidVol'][0] * data[
+                                'bidPrice'][0] * 100
+                            # 优化封单金额变化率计算，避免除零错误
+                            with stock_status['封单金额'].get_lock():
+                                previous_amount = stock_status['封单金额'].value
+                            if previous_amount > 0:
+                                change_rate = (
+                                    limit_up_amount -
+                                    previous_amount) / previous_amount
+                            else:
+                                change_rate = 0 if limit_up_amount == 0 else 1.0  # 从0变为正数视为100%增长
+
+                            with stock_status['封单金额变化率'].get_lock():
+                                stock_status['封单金额变化率'].value = change_rate
+                            with stock_status['封单金额'].get_lock():
+                                stock_status['封单金额'].value = limit_up_amount
+
+                            logger.debug(
+                                f'{stock_code} 封单金额变化率 {change_rate:.2%}, 当前封单金额 {limit_up_amount}, 快照: {data}'
+                            )
+
+                        # 2. 首次涨停
+                        elif current_stock_status == StockLimitStatusInt.NOT_LIMIT_UP:
+                            with stock_status['股票状态'].get_lock():
+                                stock_status[
+                                    '股票状态'].value = StockLimitStatusInt.LIMIT_UP
+                            with stock_status['封单金额'].get_lock():
+                                stock_status['封单金额'].value = data['bidVol'][
+                                    0] * data['bidPrice'][0] * 100
+
+                            if stock_code not in limit_up_pool:
+                                limit_up_pool[stock_code] = f'{data["time"]},'
+                            else:
+                                # 追加涨停时间
+                                limit_up_pool[stock_code] += f'{data["time"]},'
+
+                            logger.info(
+                                f'{stock_code} {stock_info["股票名称"]} 涨停，当前价格：{data["bidPrice"][0]}，涨停价：{limit_up_price}'
+                            )
+
+                        # 3. 涨停回封
+                        elif current_stock_status == StockLimitStatusInt.LIMIT_UP_BROKEN:
+                            with stock_status['股票状态'].get_lock():
+                                stock_status[
+                                    '股票状态'].value = StockLimitStatusInt.LIMIT_UP
+                            with stock_status['封单金额'].get_lock():
+                                stock_status['封单金额'].value = data['bidVol'][
+                                    0] * data['bidPrice'][0] * 100
+                            limit_up_pool[stock_code] += f'{data["time"]},'
+
+                            # 开板时长
+                            limit_up_break_duration = _calc_limit_up_break_duration(
+                                data['time'],
+                                break_pool[stock_code][:-1].split(',')[-1])
+
+                            if limit_up_break_duration <= 60:
+                                break_count[
+                                    stock_code] -= 1  # 如果开板时间小于60秒，暂不记录开板次数
+
+                            if (stock_code not in max_break_time
+                                    or limit_up_break_duration >
+                                    max_break_time[stock_code]):
+                                max_break_time[
+                                    stock_code] = limit_up_break_duration
+
+                            logger.info(
+                                f'{stock_code} {stock_info["股票名称"]} 回封涨停，开板时长:{int(limit_up_break_duration)}秒, 当前价格：{data["bidPrice"][0]}，涨停价：{limit_up_price}'
+                            )
+
+                    else:
+                        # 1. 炸板
+                        with stock_status['股票状态'].get_lock():
+                            current_stock_status_for_break = stock_status[
+                                '股票状态'].value
+                        if current_stock_status_for_break == StockLimitStatusInt.LIMIT_UP:
+                            # 涨停开板
+                            with stock_status['股票状态'].get_lock():
+                                stock_status[
+                                    '股票状态'].value = StockLimitStatusInt.LIMIT_UP_BROKEN
+                            with stock_status['封单金额'].get_lock():
+                                stock_status['封单金额'].value = 0.0
+
+                            # 记录炸板时间
+                            if stock_code not in break_pool:
+                                break_pool[stock_code] = f'{data["time"]},'
+                            else:
+                                # 追加炸板时间
+                                break_pool[stock_code] += f'{data["time"]},'
+
+                            if stock_code in break_count:
+                                break_count[stock_code] += 1
+                            else:
+                                break_count[stock_code] = 1
+
+                            logger.info(
+                                f'{stock_code} {stock_info["股票名称"]} 开板，当前价格：{data["bidPrice"][0]}，涨停价：{limit_up_price}'
+                            )
+
+                        # 2. 开板未回封
+                        elif current_stock_status_for_break == StockLimitStatusInt.LIMIT_UP_BROKEN:
+                            # 开板时长
+                            limit_up_break_duration = _calc_limit_up_break_duration(
+                                data['time'],
+                                break_pool[stock_code][:-1].split(',')[-1])
+
+                            if (stock_code not in max_break_time
+                                    or limit_up_break_duration >
+                                    max_break_time[stock_code]):
+                                max_break_time[
+                                    stock_code] = limit_up_break_duration
+
+                            # 如果开板次数超过阈值，或者开板时间超过阈值，则加入黑名单
+                            up_limit_break_count = break_count[stock_code]
+                            if limit_up_break_duration <= 60:
+                                up_limit_break_count -= 1  # 如果开板时间小于60秒，暂不记录开板次数
+
+                            # 开板次数过多，加入黑名单
+                            if up_limit_break_count >= MAX_UP_LIMIT_BREAK_COUNT:
+                                # 加入黑名单
+                                msg = f'[黑名单] {stock_code} {stock_info["股票名称"]} 开板次数过多，加入黑名单，开板次数：{up_limit_break_count}'
+                                if stock_code not in blacklist:
+                                    blacklist[stock_code] = msg
+                                    logger.warning(msg)
+                                    send_email(
+                                        f'【黑名单】{stock_code} {stock_info["股票名称"]}',
+                                        msg)
+
+                            # 开板时间过长，加入黑名单
+                            if max_break_time[
+                                    stock_code] >= MAX_UP_LIMIT_BREAK_TIME:
+                                # 加入黑名单
+                                msg = f'[黑名单] {stock_code} {stock_info["股票名称"]} 开板时间过长，加入黑名单，最大开板时长：{int(max_break_time[stock_code])}秒'
+                                if stock_code not in blacklist:
+                                    blacklist[stock_code] = msg
+                                    logger.warning(msg)
+                                    send_email(
+                                        f'【黑名单】{stock_code} {stock_info["股票名称"]}',
+                                        msg)
+
+                            # 如果当前股价下跌超3%，且开板时间超过10分钟，则加入黑名单
+                            if (float(data['lastPrice'] / limit_up_price) <
+                                    0.97 and limit_up_break_duration >
+                                    MAX_UP_LIMIT_BREAK_TIME / 2):
+                                msg = f'[黑名单] {stock_code} {stock_info["股票名称"]} 开板后股价下跌超过3%，加入黑名单，当前价格：{data["lastPrice"]}, 涨停价：{limit_up_price}'
+                                if stock_code not in blacklist:
+                                    blacklist[stock_code] = msg
+                                    logger.warning(msg)
+                                    send_email(
+                                        f'【黑名单】{stock_code} {stock_info["股票名称"]}',
+                                        msg)
+
+                    # --------------------------- 更新区间最高价并计算移动止损价格 -------------------------- #
+                    if stock_code in pre_market_holdings and stock_code in holding_status:
+                        with stock_status['最高价'].get_lock():
+                            current_highest = stock_status['最高价'].value
+
+                        new_price = down_limit_price if is_down_limit else data[
+                            'bidPrice'][0]
+
+                        if new_price > current_highest:
+                            with stock_status['最高价'].get_lock():
+                                stock_status['最高价'].value = new_price
+
+                            logger.info(f"[{stock_code}] 更新最高价为: {new_price}")
+
+                            # 重新计算止盈止损价格
+                            calculate_trailing_stop_prices(
+                                highest_price=new_price,
+                                limit_down_price=down_limit_price,  # 跌停价
+                                stock_code=stock_code,
+                                shared_data=shared_data)
+
+                    # ---------------------------------------------------------------------------- #
+                    #                                  模拟 - 检查是否成交                          #
+                    # ---------------------------------------------------------------------------- #
+                    if (DEBUG_MODE
+                            or shadow_signal_mode) and check_order_successed(
+                                shared_data, stock_code, data, is_limit_up,
+                                strong_stocks, order_status, stock_status):
+                        _order = {
+                            '委托类型': OrderType.BUY,
+                            '股票代码': stock_code,
+                            '委托价格': limit_up_price,
+                            '报价类型': xtconstant.FIX_PRICE,
+                            '策略名称': STRATEGY_NAME,
+                            '委托备注': '买入',
+                            '买入类型': '模拟成交',
+                            '快照': data  # 附带当前Tick快照
+                        }
+                        logger.warning(f'模拟成交订单: {_order}')
+                        order_queue.put(_order)
+
+                    # ---------------------------------------------------------------------------- #
+                    #                                    决策信号生成                               #
+                    # ---------------------------------------------------------------------------- #
+                    if should_buy(shared_data,
+                                  data,
+                                  stock_code,
+                                  is_limit_up,
+                                  is_near_limit_up,
+                                  stock_info,
+                                  stock_status,
+                                  market_sentiment_score,
+                                  blacklist,
+                                  strong_stocks,
+                                  holding_status,
+                                  limit_up_pool,
+                                  concept_sector_effect,
+                                  industry_sector_effect,
+                                  individual_capital_inflow,
+                                  cancel_count,
+                                  shadow_signal_mode=shadow_signal_mode,
+                                  order=order):
+                        # ------------------------------------ 买入 ------------------------------------ #
+                        with cancel_count.get_lock():
+                            cancel_count_val = cancel_count.value
+                        if is_limit_up and cancel_count_val > MAX_CANCEL_COUNT:
+                            logger.warning(
+                                f'{stock_code} 撤单次数超过{MAX_CANCEL_COUNT}次，跳过排板买入'
+                            )
+                            continue
+
+                        order.update({
+                            '委托类型': OrderType.BUY,
+                            '股票代码': stock_code,
+                            '委托价格': limit_up_price,
+                            '报价类型': xtconstant.FIX_PRICE,
+                            '策略名称': STRATEGY_NAME,
+                            '委托备注': '买入',
+                            '买入类型': '排板' if is_limit_up else '扫板',
+                            '快照': data  # 附带当前Tick快照
+                        })
+                        order_queue.put(order)
+                        with stock_status['下单状态'].get_lock():
+                            stock_status[
+                                '下单状态'].value = StockOrderStatusInt.ORDERED_BUY
+
+                    elif should_cancel(shared_data,
+                                       data,
+                                       stock_code,
+                                       is_limit_up,
+                                       is_down_limit,
+                                       stock_info,
+                                       stock_status,
+                                       market_sentiment_score,
+                                       blacklist,
+                                       concept_sector_effect,
+                                       industry_sector_effect,
+                                       individual_capital_inflow,
+                                       holding_status,
+                                       order_status,
+                                       shadow_signal_mode=shadow_signal_mode,
+                                       order=order):
+                        # ------------------------------------ 撤单 ------------------------------------ #
+                        order.update({
+                            '委托类型': OrderType.CANCEL,
+                            '股票代码': stock_code,
+                            '策略名称': STRATEGY_NAME,
+                            '委托备注': '撤单',
+                            '快照': data  # 附带当前Tick快照
+                        })
+                        order_queue.put(order)
+
+                    elif should_sell(shared_data=shared_data,
+                                     stock_code=stock_code,
+                                     tick_data=data,
+                                     is_down_limit=is_down_limit,
+                                     is_near_limit_up=is_near_limit_up,
+                                     is_limit_up=is_limit_up,
+                                     down_limit_price=down_limit_price,
+                                     stock_status=stock_status,
+                                     stock_info=stock_info,
+                                     holding_status=holding_status,
+                                     pre_market_holdings=pre_market_holdings,
+                                     order=order):
+                        # ----------------------------------- 卖出 ------------------------------------ #
+                        order_queue.put(order)
+
+                # ----------------------------- 记录前买一价格及扫板所需资金等 ----------------------------- #
+                with stock_status['前一价格'].get_lock():
+                    stock_status['前一价格'].value = data['bidPrice'][0] if data[
+                        'bidPrice'] else data['lastPrice']
+                with stock_status['拉板所需资金'].get_lock():
+                    stock_status['拉板所需资金'].value = (
+                        0.0 if not is_near_limit_up else
+                        np.dot(data['bidPrice'], data['bidVol']) * 100)
+
+            # ----------------------------------- 记录日志 ----------------------------------- #
+            if datas:  # 性能优化：只在有数据时记录日志
+                stock_code = list(datas.keys())[0]
+                latency = _calc_delay_time(datas[stock_code]['time'])
+                cost_time = round(time.time() - start_time, 2)
+                logger.debug(
+                    f'【Tick数据处理】延迟：{latency}s\t总耗时：{cost_time}\t大小：{len(datas.keys())}'
+                )
+
+        except Empty:
+            time.sleep(1)
+            if datetime.now().time() >= STOP_TIME:
+                logger.warning(f'【进程退出】{current_process().name}')
+                return
+        except Exception as e:
+            logger.exception(f'处理tick数据失败：{e}\n{traceback.format_exc()}')
+
+
+# ---------------------------------------------------------------------------- #
+#                         create_whole_quote_task 订阅任务                       #
+# ---------------------------------------------------------------------------- #
+
+def create_whole_quote_task(stock_pool,
+                            stock_info_dict,
+                            tick_queue,
+                            shadow_tick_queue=None):
+    """创建全推行情订阅任务
+
+    Args:
+        stock_pool (list): 股票池，包含股票代码
+        stock_info_dict (dict): 股票信息字典，包含股票代码和相关信息
+        tick_queue (Queue): 用于存储tick数据的队列
+        shadow_tick_queue (Queue, optional): 影子模式tick数据队列
+
+    Features (v2.4新增):
+        - 回调心跳监控：监控xtdata回调是否正常工作
+        - 自动重新订阅：当回调超时时自动重新订阅
+        - 详细日志记录：记录回调次数和健康状态
+    """
+    from xtquant import xtdata
+
+    # 停止标识，用于控制线程退出
+    stop_flag = Value('b', False)
+    subscribe_id = -1
+
+    # 获取回调心跳监控器（v2.4新增）
+    heartbeat_monitor = get_callback_heartbeat_monitor(timeout=30)
+    heartbeat_monitor.reset()  # 重置监控器状态
+
+    try:
+        start_time = time.time()
+        partial_on_data = partial(
+            on_data,
+            tick_queue=tick_queue,
+            shadow_tick_queue=shadow_tick_queue,
+            stock_info_dict=stock_info_dict,
+            stop_flag=stop_flag,
+            heartbeat_monitor=heartbeat_monitor)  # 传递心跳监控器
+        while subscribe_id < 0:
+            subscribe_id = xtdata.subscribe_whole_quote(
+                stock_pool, callback=partial_on_data)
+            if subscribe_id < 0:
+                logger.error(f'[全推行情订阅] 订阅失败，重试中...')
+                time.sleep(1)
+
+        # ----------------------------------- 订阅成功 ----------------------------------- #
+        # 记录日志
+        timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        msg = f'【订阅成功】【全推行情】订阅成功, 总耗时：{round(time.time() - start_time,2)}秒，信号发出时间：{timestamp_now}'
+        logger.info(msg)
+
+    except Exception as e:
+        logger.exception(f'【关键错误】全推行情订阅失败：{e}')
+        send_email('【关键错误】全推行情订阅失败',
+                   f'全推行情订阅时发生异常: {e}\n{traceback.format_exc()}')
+
+    # 回调心跳检查计数器
+    heartbeat_check_count = 0
+    last_callback_count = 0
+
+    # 定义交易时间段（粗略设置：上午9:30-11:30，下午13:00-15:00）
+    def is_callback_monitor_time() -> bool:
+        """判断是否在回调监控时间段内（交易时间）"""
+        current_time = datetime.now().time()
+        morning_start, morning_end = dt_time(9, 30), dt_time(11, 30)
+        afternoon_start, afternoon_end = dt_time(13, 0), dt_time(15, 0)
+        return (morning_start <= current_time <= morning_end) or (
+            afternoon_start <= current_time <= afternoon_end)
+
+    while True:
+        time.sleep(1)
+        if datetime.now().time() >= STOP_TIME:
+            logger.warning(f'【进程退出】{current_process().name}')
+            return
+
+        # v2.4新增：检查回调心跳健康状态（每5秒检查一次，仅在交易时间内）
+        heartbeat_check_count += 1
+        if heartbeat_check_count >= 5:
+            heartbeat_check_count = 0
+
+            # 仅在交易时间内进行心跳监控
+            if not is_callback_monitor_time():
+                logger.debug('[回调心跳] 当前不在交易时间，跳过心跳检查')
+                continue
+
+            # 获取当前回调次数
+            current_callback_count = heartbeat_monitor.get_callback_count()
+
+            # 检查回调是否停止（回调次数没有增加）
+            if current_callback_count == last_callback_count and last_callback_count > 0:
+                # 检查心跳是否超时
+                if heartbeat_monitor.check_and_notify():
+                    logger.critical(
+                        f'【回调异常】回调心跳超时，回调次数无变化: {current_callback_count}，'
+                        f'距离上次回调: {heartbeat_monitor.get_last_callback_age():.1f}s，'
+                        f'错误次数: {heartbeat_monitor.get_error_count()}')
+                    send_email(
+                        '【关键告警】全推行情回调异常', f'全推行情回调心跳超时，可能已停止工作。\n'
+                        f'回调次数: {current_callback_count}\n'
+                        f'距离上次回调: {heartbeat_monitor.get_last_callback_age():.1f}s\n'
+                        f'错误次数: {heartbeat_monitor.get_error_count()}\n'
+                        f'正在尝试重新订阅...')
+                    stop_flag.value = True  # 触发重新订阅
+
+            last_callback_count = current_callback_count
+
+            # 每5秒输出一次心跳状态（DEBUG级别）
+            logger.debug(
+                f'[回调心跳] 回调次数: {current_callback_count}, '
+                f'距离上次回调: {heartbeat_monitor.get_last_callback_age():.1f}s, '
+                f'健康: {heartbeat_monitor.is_healthy()}')
+
+        if stop_flag.value:
+            # 取消订阅，关闭进程，释放资源，重新订阅
+            if subscribe_id > 0:
+                xtdata.unsubscribe_quote(subscribe_id)
+                logger.warning(f'【取消订阅】【全推行情】{subscribe_id}')
+
+            # 重新订阅
+            logger.warning(f'【进程退出】{current_process().name}，连接断开或回调异常，重新订阅')
+            create_whole_quote_task(stock_pool, stock_info_dict, tick_queue,
+                                    shadow_tick_queue)
+            return
