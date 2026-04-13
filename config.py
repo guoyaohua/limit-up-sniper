@@ -15,7 +15,6 @@ from infra.common_enums import PreMarketSellStrategy
 VERSION = 'v2.4'
 DEBUG_MODE = False
 ENABLE_SHADOW_SIGNAL = False  # 影子信号模式：不真实下单，而是使用与实盘相同的策略只发出交易信号，用于复盘用。
-IS_LIVE_TRADING = not DEBUG_MODE  # 是否为实盘交易模式
 
 # 板块数据源配置: 'THS' (同花顺) 或 'EM' (东方财富)，默认使用THS
 SECTOR_DATA_SOURCE = 'THS'
@@ -23,26 +22,29 @@ SECTOR_DATA_SOURCE = 'THS'
 STRATEGY_NAME = f'FirstLimitUp_{VERSION}_Debug' if DEBUG_MODE else f'FirstLimitUp_{VERSION}'  # 不要出现中文，以免FTP目录出现乱码
 SHOULD_DOWNLOAD_KLINE = True
 
-if IS_LIVE_TRADING:
-    # !!! 中金模拟端配置 !!! 注意 这是实盘 !!!
-    CLIENT_PATH = '<redacted-qmt-path>'
-    STOCK_ACCOUNT = '<redacted-account>'
-else:
-    # 国金模拟端配置 1
-    CLIENT_PATH = '<redacted-qmt-path>'
-    STOCK_ACCOUNT = '<redacted-account>'
+# 选择交易端配置
+CLIENT_NAME = 'CICC_LIVE'
+CLIENT_CONFIGS = {
+    'CICC_LIVE': {
+        'client_path': '<redacted-qmt-path>',
+        'stock_account': '<redacted-account>',
+        'is_live_trading': True,
+    },
+    'GJ_SIM': {
+        'client_path': '<redacted-qmt-path>',
+        'stock_account': '<redacted-account>',
+        'is_live_trading': False,
+    },
+}
+
+_selected_client = CLIENT_CONFIGS[CLIENT_NAME]
+CLIENT_PATH = _selected_client['client_path']
+STOCK_ACCOUNT = _selected_client['stock_account']
+IS_LIVE_TRADING = _selected_client['is_live_trading']  # 是否为实盘交易模式
 
 # 使用实盘数据源
 IP = '127.0.0.1'
 PORT = 58610
-
-# # 国金模拟端配置 2
-# CLIENT_PATH = '<redacted-qmt-path>'
-# STOCK_ACCOUNT = '<redacted-account>'
-
-# # 中金模拟端配置
-# CLIENT_PATH = '<redacted-qmt-path>'
-# STOCK_ACCOUNT = '<redacted-account>'
 
 # ---------------------------------------------------------------------------- #
 
