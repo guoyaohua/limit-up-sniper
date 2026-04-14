@@ -23,7 +23,7 @@ STRATEGY_NAME = f'FirstLimitUp_{VERSION}_Debug' if DEBUG_MODE else f'FirstLimitU
 SHOULD_DOWNLOAD_KLINE = True
 
 # 选择交易端配置
-CLIENT_NAME = 'CICC_LIVE'
+CLIENT_NAME = 'GJ_SIM'
 CLIENT_CONFIGS = {
     'CICC_LIVE': {
         'client_path': '<redacted-qmt-path>',

@@ -66,6 +66,7 @@ DASHSCOPE_DEFAULT_MODEL = "MiniMax-M2.5"
 
 # DashScope 支持的模型列表
 DASHSCOPE_AVAILABLE_MODELS = [
+    # "qwen3.6-plus",
     "qwen3.5-plus",
     "kimi-k2.5",
     "glm-5",
@@ -78,6 +79,7 @@ DASHSCOPE_AVAILABLE_MODELS = [
 
 # DashScope 支持 Vision 的模型列表
 DASHSCOPE_VISION_MODELS = [
+    # "qwen3.6-plus",
     "qwen3.5-plus",
     "kimi-k2.5",
 ]
