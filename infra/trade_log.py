@@ -15,18 +15,122 @@ from infra.common_enums import StockLimitStatusInt
 from infra.utils import send_email
 
 
-def save_trade_log(trade_record: dict):
-    """U8升级：保存结构化交易日志到 JSON 文件"""
-    try:
+EVENT_LOG_FILENAME = 'events.jsonl'
+
+
+def _json_default(obj):
+    """JSON 序列化兜底。"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    return str(obj)
+
+
+def _get_trade_log_dir(date_str: str | None = None) -> str:
+    """获取当日交易日志目录。"""
+    if date_str is None:
         date_str = datetime.now().strftime('%Y%m%d')
-        log_dir = os.path.join(TRADE_LOG_DIR, date_str)
-        os.makedirs(log_dir, exist_ok=True)
+    log_dir = os.path.join(TRADE_LOG_DIR, date_str)
+    os.makedirs(log_dir, exist_ok=True)
+    return log_dir
+
+
+def _build_tick_snapshot(snapshot: dict | None) -> dict:
+    """提取适合落盘的 Tick 摘要。"""
+    if not snapshot:
+        return {}
+
+    summary = {}
+    for field in ('time', 'lastPrice', 'open', 'high', 'low', 'lastClose',
+                  'amount', 'volume', 'pvolume', 'stockStatus'):
+        if field in snapshot:
+            summary[field] = snapshot.get(field)
+
+    for field in ('bidPrice', 'askPrice', 'bidVol', 'askVol'):
+        values = snapshot.get(field)
+        if values:
+            summary[field] = values[0]
+
+    return summary
+
+
+def append_trade_event(event_record: dict):
+    """追加结构化事件到当日日志 JSONL。"""
+    try:
+        filepath = os.path.join(_get_trade_log_dir(), EVENT_LOG_FILENAME)
+        with open(filepath, 'a', encoding='utf-8') as f:
+            f.write(
+                json.dumps(event_record,
+                           ensure_ascii=False,
+                           default=_json_default) + '\n')
+    except Exception as e:
+        logger.debug(f'保存事件日志失败: {e}')
+
+
+def record_strategy_event(shared_data: dict,
+                          event_type: str,
+                          stock_code: str,
+                          stock_name: str = '',
+                          reason: str = '',
+                          snapshot: dict | None = None,
+                          extra: dict | None = None) -> dict:
+    """记录统一的盘中结构化事件。"""
+    timestamp_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+    event_record = {
+        'event_type': event_type,
+        'timestamp': timestamp_now,
+        'stock_code': stock_code,
+    }
+    if stock_name:
+        event_record['stock_name'] = stock_name
+    if reason:
+        event_record['reason'] = reason
+
+    market_sentiment = shared_data.get('市场情绪_评分') if shared_data else None
+    if hasattr(market_sentiment, 'value'):
+        event_record['market_sentiment'] = market_sentiment.value
+
+    snapshot_summary = _build_tick_snapshot(snapshot)
+    if snapshot_summary:
+        event_record['snapshot'] = snapshot_summary
+
+    if extra:
+        event_record.update(extra)
+
+    if shared_data:
+        intraday_snapshot = shared_data.get('盘中特征快照')
+        if intraday_snapshot is not None and stock_code:
+            intraday_snapshot[stock_code] = {
+                'event_type': event_type,
+                'timestamp': timestamp_now,
+                'stock_name': stock_name,
+                'reason': reason,
+                **snapshot_summary,
+            }
+
+        event_buffer = shared_data.get('盘中事件流')
+        if event_buffer is not None:
+            event_buffer.append(event_record)
+
+    append_trade_event(event_record)
+    return event_record
+
+
+def save_trade_log(trade_record: dict):
+    """U8升级：保存结构化交易日志到 JSON 文件。"""
+    try:
+        log_dir = _get_trade_log_dir()
         timestamp = datetime.now().strftime('%H%M%S_%f')
         stock_code = trade_record.get('stock_code', 'unknown')
         filename = f'trade_{timestamp}_{stock_code}.json'
         filepath = os.path.join(log_dir, filename)
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(trade_record, f, ensure_ascii=False, indent=2, default=str)
+
+        append_trade_event({
+            'event_type': 'order_submitted',
+            'record_type': 'trade',
+            **trade_record,
+        })
     except Exception as e:
         logger.debug(f'保存交易日志失败: {e}')
 

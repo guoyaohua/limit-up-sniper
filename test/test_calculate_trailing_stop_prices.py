@@ -17,32 +17,14 @@ import sys
 import os
 import json
 import unittest
-from unittest.mock import MagicMock, patch
-from multiprocessing import Value, Array, Manager
+from multiprocessing import Value, Array
 
 # 添加父目录到路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 导入被测函数和相关工具
-# 注意：由于模块名包含中文和点号，需要使用 importlib 导入
-import importlib.util
-
-def _import_strategy_module():
-    """动态导入打板策略模块"""
-    module_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "打板策略_v2.4.py"
-    )
-    spec = importlib.util.spec_from_file_location("strategy_v2_4", module_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-# 导入策略模块
-_strategy_module = _import_strategy_module()
-calculate_trailing_stop_prices = _strategy_module.calculate_trailing_stop_prices
-_round_price = _strategy_module._round_price
-STOP_LOSS_RATE = _strategy_module.STOP_LOSS_RATE
+from core.trailing_stop import calculate_trailing_stop_prices
+from infra.data_helpers import _round_price
+from config import STOP_LOSS_RATE
 
 
 def create_mock_shared_data(stock_code: str,
@@ -135,29 +117,29 @@ def print_result(prices: list, volumes: list, scenario_name: str,
                  available_volume: int):
     """打印测试结果"""
     print("\n" + "=" * 80)
-    print(f"📊 测试场景: {scenario_name}")
+    print(f"[SCENARIO]测试场景: {scenario_name}")
     print("=" * 80)
     
     if not prices or all(p == 0 for p in prices):
-        print("❌ 计算失败或无结果")
+        print("[ERROR]计算失败或无结果")
         return
     
     profit_ratio = (highest_price - cost_price) / cost_price if cost_price > 0 else 0
     distance_to_limit_ratio = (limit_up_price - highest_price) / (limit_up_price - cost_price) if limit_up_price > cost_price else 1.0
     distance_to_limit_ratio = max(0, min(1, distance_to_limit_ratio))
     
-    print(f"\n📈 输入参数:")
+    print(f"\n[INPUT]输入参数:")
     print(f"   - 最高价: {highest_price:.2f}")
     print(f"   - 成本价: {cost_price:.2f}")
     print(f"   - 涨停价: {limit_up_price:.2f}")
     print(f"   - 可用数量: {available_volume}")
     
-    print(f"\n📊 计算结果:")
+    print(f"\n[SCENARIO]计算结果:")
     print(f"   - 利润率: {profit_ratio:.2%}")
     print(f"   - 距涨停比例: {distance_to_limit_ratio:.2%}")
     print(f"   - 基础止损价 (v2.4.2): {highest_price * (1 - STOP_LOSS_RATE):.2f} (基于最高价)")
     
-    print("\n📋 止盈止损价格和目标仓位:")
+    print("\n[DETAIL]止盈止损价格和目标仓位:")
     print("-" * 70)
     print(f"{'档位':<6} {'价格':<12} {'回撤比例':<12} {'目标仓位':<12} {'卖出数量':<12}")
     print("-" * 70)
@@ -208,9 +190,9 @@ class TestCalculateTrailingStopPrices(unittest.TestCase):
         self.assertEqual(len(prices), 10, "应该有10个价格档位")
         self.assertEqual(len(volumes), 10, "应该有10个仓位档位")
         
-        # 价格应该递减
+        # 价格应该严格递减
         for i in range(1, 10):
-            self.assertLessEqual(prices[i], prices[i-1], f"价格应该递减: 档位{i}")
+            self.assertLess(prices[i], prices[i-1], f"价格应该严格递减: 档位{i}")
         
         # 最后一档应该清仓
         self.assertEqual(volumes[-1], 0, "最后一档应该清仓")
@@ -316,31 +298,59 @@ class TestCalculateTrailingStopPrices(unittest.TestCase):
         limit_up_price = 11.0
         limit_down_price = 9.0
         small_volume = 50
-        
+
         shared_data = create_mock_shared_data(
             self.stock_code, cost_price, small_volume,
             small_volume, limit_up_price
         )
-        
+
         calculate_trailing_stop_prices(
             highest_price=highest_price,
             limit_down_price=limit_down_price,
             stock_code=self.stock_code,
             shared_data=shared_data
         )
-        
+
         prices, volumes = get_results_from_shared_data(shared_data, self.stock_code)
-        
+
         self.assertEqual(len(prices), 10)
-        
+
         # 小仓位策略：前6档持有，后4档清仓
         for i in range(6):
             self.assertEqual(volumes[i], small_volume, f"小仓位前{i+1}档应保持持仓")
         for i in range(6, 10):
             self.assertEqual(volumes[i], 0, f"小仓位后{i+1-6}档应清仓")
-        
+
         print_result(prices, volumes, "小仓位（50股，不足1手）",
                      highest_price, cost_price, limit_up_price, small_volume)
+
+    def test_target_volumes_are_monotonic_and_bounded(self):
+        """测试目标剩余仓位单调不增且不超出可用数量"""
+        highest_price = 10.7
+        cost_price = 10.0
+        limit_up_price = 11.0
+        limit_down_price = 9.0
+
+        shared_data = create_mock_shared_data(
+            self.stock_code, cost_price, self.available_volume,
+            self.hold_volume, limit_up_price
+        )
+
+        calculate_trailing_stop_prices(
+            highest_price=highest_price,
+            limit_down_price=limit_down_price,
+            stock_code=self.stock_code,
+            shared_data=shared_data
+        )
+
+        _, volumes = get_results_from_shared_data(shared_data, self.stock_code)
+
+        self.assertEqual(volumes[-1], 0)
+        for volume in volumes:
+            self.assertGreaterEqual(volume, 0)
+            self.assertLessEqual(volume, self.available_volume)
+        for i in range(1, len(volumes)):
+            self.assertLessEqual(volumes[i], volumes[i - 1], f"目标剩余仓位应单调不增: 档位{i}")
         
     def test_price_not_below_limit_down(self):
         """测试价格不能低于跌停价"""
@@ -399,7 +409,7 @@ class TestCalculateTrailingStopPrices(unittest.TestCase):
         min_expected_price = max(expected_base_stop_loss, limit_down_price)
         
         # 打印验证信息
-        print(f"\n🔍 v2.4.2 验证: base_stop_loss_price 基于 highest_price")
+        print(f"\n[CHECK]v2.4.2 验证: base_stop_loss_price 基于 highest_price")
         print(f"   - highest_price: {highest_price}")
         print(f"   - STOP_LOSS_RATE: {STOP_LOSS_RATE}")
         print(f"   - 预期 base_stop_loss: {expected_base_stop_loss}")
@@ -454,9 +464,9 @@ class TestCalculateTrailingStopPrices(unittest.TestCase):
 def run_visual_tests():
     """运行可视化测试（用于手动验证）"""
     
-    print("\n" + "🔬" * 40)
+    print("\n" + "=" * 40)
     print("   calculate_trailing_stop_prices 函数测试 (v2.4.2)")
-    print("🔬" * 40)
+    print("=" * 40)
     
     stock_code = "600000.SH"
     available_volume = 1000
@@ -522,22 +532,22 @@ def run_visual_tests():
     
     # 总结
     print("\n" + "=" * 80)
-    print("📝 测试总结 (v2.4.2 更新)")
+    print("[SUMMARY]测试总结 (v2.4.2 更新)")
     print("=" * 80)
     print("""
-✅ v2.4.2 关键更新已验证：
+[OK]v2.4.2 关键更新已验证：
 
-1. ✅ base_stop_loss_price 改为基于 highest_price 计算
+1. [OK]base_stop_loss_price 改为基于 highest_price 计算
    - 旧版: base_stop_loss_price = cost_price * (1 - STOP_LOSS_RATE)
    - 新版: base_stop_loss_price = highest_price * (1 - STOP_LOSS_RATE)
    - 更符合跟踪止损的核心逻辑
 
-2. ✅ 详细日志记录增强
+2. [OK]详细日志记录增强
    - 函数入口参数记录
    - 中间计算步骤详细输出
    - 各档位触发条件和仓位变化记录
 
-3. ✅ 策略逻辑保持不变
+3. [OK]策略逻辑保持不变
    - 利润越高，止损价上移越多（保护更多利润）
    - 距涨停越近，前几档间距越窄（快速锁定利润）
    - 高利润时减仓更激进，亏损时减仓更保守
@@ -560,7 +570,7 @@ if __name__ == '__main__':
     
     if args.unittest or (not args.visual and not args.unittest):
         # 默认运行单元测试
-        print("\n🧪 运行单元测试...")
+        print("\n[TEST]运行单元测试...")
         unittest.main(argv=[''], exit=False, verbosity=2)
     
     if args.visual:

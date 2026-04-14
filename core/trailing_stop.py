@@ -204,13 +204,13 @@ def calculate_trailing_stop_prices(highest_price: float,
             cumulative_drawdown += step_ratios[i] * total_drawdown_space
             price = _round_price(highest_price - cumulative_drawdown)
 
-            # # 确保价格严格递减，至少相差0.01元
-            # if price >= last_price and i > 0:
-            #     price = _round_price(last_price - 0.01)
-            #     logger.debug(
-            #         f"[{stock_code}] [止盈止损计算-价格调整] "
-            #         f"档位{i+1}: 价格调整为 {price:.3f}（确保严格递减）"
-            #     )
+            # 确保价格严格递减，至少相差0.01元
+            if price >= last_price and i > 0:
+                price = _round_price(last_price - 0.01)
+                logger.debug(
+                    f"[{stock_code}] [止盈止损计算-价格调整] "
+                    f"档位{i+1}: 价格调整为 {price:.3f}（确保严格递减）"
+                )
 
             # 价格不能低于跌停价
             if price < limit_down_price:
@@ -281,6 +281,9 @@ def calculate_trailing_stop_prices(highest_price: float,
                 if vol == 0 and ratio > 0:
                     vol = 100
 
+            if target_volumes:
+                vol = min(vol, target_volumes[-1])
+            vol = min(vol, available_volume)
             target_volumes.append(vol)
 
         # 确保最后一个仓位为0（止损清仓）

@@ -268,6 +268,8 @@ def run_xt_trader_task(order_queue, shared_data):
                     logger.warning(
                         f'[观察名单-仓位缩减] {stock_code} 在观察名单中，仓位缩减至 {WATCHLIST_POSITION_RATIO*100:.0f}%，买入数量: {order_volume}'
                     )
+                max_affordable_volume = int(available_cash / order_req['委托价格'] / 100) * 100
+                order_volume = min(order_volume, max_affordable_volume)
                 if order_volume <= 0:
                     logger.warning(f'[跳过购买] 计算后买入数量为0: {stock_code}')
                     continue

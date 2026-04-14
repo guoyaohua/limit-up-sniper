@@ -45,7 +45,71 @@ from infra.common_enums import (
 )
 from infra.data_helpers import _conv_time_cached, _check_same_price
 from infra.utils import send_email
+from infra.trade_log import record_strategy_event
 from core.interpolation import interpolate_seal_threshold, interpolate_sector_requirements
+
+
+def _calculate_turnover_rate(tick_data, stock_info):
+    """计算换手率。"""
+    float_shares = stock_info.get('流通股本', 0)
+    if float_shares <= 0:
+        raise ValueError(f'流通股本数据异常: {float_shares}')
+    return tick_data.get('pvolume', 0) / float_shares * 100
+
+
+def _add_to_watchlist(shared_data,
+                      blacklist,
+                      stock_code,
+                      stock_name,
+                      turnover_rate,
+                      source='turnover',
+                      snapshot=None):
+    """将股票加入观察名单。"""
+    watch_list = shared_data.get('观察名单')
+    watchlist_metadata = shared_data.get('观察名单元数据')
+    if watch_list is None or stock_code in blacklist or stock_code in watch_list:
+        return
+
+    timestamp = time.time()
+    watch_list[stock_code] = f'{turnover_rate:.1f}%|{timestamp}'
+    metadata = {
+        'turnover_rate': round(turnover_rate, 4),
+        'enter_timestamp': timestamp,
+        'enter_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'),
+        'source': source,
+        'stock_name': stock_name,
+        'position_ratio': WATCHLIST_POSITION_RATIO,
+    }
+    if snapshot:
+        metadata['snapshot_time'] = snapshot.get('time')
+        metadata['last_price'] = snapshot.get('lastPrice')
+        metadata['limit_price'] = snapshot.get('bidPrice', [None])[0] if snapshot.get('bidPrice') else None
+    if watchlist_metadata is not None:
+        watchlist_metadata[stock_code] = metadata
+
+    if shared_data.get('决策原因标签') is not None:
+        shared_data['决策原因标签'][stock_code] = {
+            'decision': 'watchlist_enter',
+            'source': source,
+            'turnover_rate': round(turnover_rate, 4),
+            'timestamp': metadata['enter_time'],
+        }
+
+    record_strategy_event(
+        shared_data,
+        event_type='watchlist_enter',
+        stock_code=stock_code,
+        stock_name=stock_name,
+        reason=f'换手率 {turnover_rate:.1f}% 偏高，加入观察名单',
+        snapshot=snapshot,
+        extra={
+            'source': source,
+            'turnover_rate': round(turnover_rate, 4),
+            'position_ratio': WATCHLIST_POSITION_RATIO,
+        })
+    logger.warning(
+        f'[观察名单] {stock_code} {stock_name} 换手率 {turnover_rate:.1f}% 偏高，加入观察名单，仓位缩减至{WATCHLIST_POSITION_RATIO*100:.0f}%'
+    )
 
 
 def leading_stock_check(sector_info: str, stock_code: str) -> tuple:
@@ -248,18 +312,19 @@ def should_buy(shared_data,
         # 买入原因
         buy_reason = ''
         stock_name = stock_info["股票名称"]
-        # -------------------------- 1. 换手率（换手率超过3%，且不超过15%） ------------------------- #
-        # 添加流通股本检查，避免除零错误
-        float_shares = stock_info.get('流通股本', 0)
-        if float_shares <= 0:
-            logger.error(
-                f'{log_prefix}[不买入-流通股本异常] {stock_code} 流通股本数据异常: {float_shares}'
-            )
+        # -------------------------- 1. 换手率（分桶处理） ------------------------- #
+        try:
+            turnover_rate = _calculate_turnover_rate(tick_data, stock_info)
+        except ValueError as exc:
+            logger.error(f'{log_prefix}[不买入-流通股本异常] {stock_code} {exc}')
             return False
 
-        turnover_rate = tick_data['pvolume'] / float_shares * 100
-        # U5升级：换手率分级处理 — ≥25%直接拉黑，15-25%加入观察名单（仓位减半），<15%正常
-        if turnover_rate >= MAX_TURNOVER_RATE_BLACKLIST:
+        if turnover_rate < MIN_TURNOVER_RATE_THRESHOLD:
+            logger.debug(
+                f'{log_prefix}[不买入-换手率] {stock_code} {turnover_rate:.2f}% < {MIN_TURNOVER_RATE_THRESHOLD}% 不满足买入条件'
+            )
+            return False
+        elif turnover_rate >= MAX_TURNOVER_RATE_BLACKLIST:
             msg = f'[黑名单] {stock_code} {stock_name} 换手率 {turnover_rate:.1f}% >= {MAX_TURNOVER_RATE_BLACKLIST}%'
             if stock_code not in blacklist:
                 blacklist[stock_code] = msg
@@ -267,19 +332,16 @@ def should_buy(shared_data,
                 send_email(f'【黑名单】{stock_code} {stock_name}', msg)
             return False
         elif turnover_rate >= MAX_TURNOVER_RATE_THRESHOLD:
-            # 15-25%：加入观察名单，不拒绝买入但后续仓位减半
-            watch_list = shared_data.get('观察名单', {})
-            if stock_code not in blacklist and stock_code not in watch_list:
-                watch_list[stock_code] = f'{turnover_rate:.1f}%|{time.time()}'
-                logger.warning(
-                    f'[观察名单] {stock_code} {stock_name} 换手率 {turnover_rate:.1f}% 偏高，加入观察名单，仓位缩减至{WATCHLIST_POSITION_RATIO*100:.0f}%'
-                )
+            _add_to_watchlist(shared_data,
+                              blacklist,
+                              stock_code,
+                              stock_name,
+                              turnover_rate,
+                              source='turnover_rate',
+                              snapshot=tick_data)
             buy_reason += f'[换手率] 换手率 {turnover_rate:.1f}% (观察名单，仓位缩减)\n'
         else:
-            logger.debug(
-                f'{log_prefix}[不买入-换手率] {stock_code} {turnover_rate} < {MIN_TURNOVER_RATE_THRESHOLD} 不满足买入条件'
-            )
-            return False
+            buy_reason += f'[换手率] 满足买入条件, 换手率 {turnover_rate:.1f}%\n'
 
         # -------------------------------- 2. 量比>=1.5 -------------------------------- #
         avg_volume_5d = stock_info['5日平均成交量']
@@ -581,7 +643,11 @@ def should_cancel(shared_data,
                 limit_order_amount = stock_status['封单金额'].value
             with stock_status['封单金额变化率'].get_lock():
                 change_rate = stock_status['封单金额变化率'].value
-            float_shares = stock_info['流通股本']
+            try:
+                turnover_rate = _calculate_turnover_rate(tick_data, stock_info)
+            except ValueError as exc:
+                logger.error(f'{log_prefix}[撤单判断-流通股本异常] {stock_code} {exc}')
+                return False
 
             # -------------------------------- 2. 封单绝对值判断 -------------------------------- #
             if limit_order_amount < MIN_LIMIT_ORDER_AMOUNT:
@@ -657,7 +723,6 @@ def should_cancel(shared_data,
                 )
 
             # --------------------------------- 4. 换手率判断 --------------------------------- #
-            turnover_rate = tick_data['pvolume'] / float_shares * 100
             # U5升级：分级处理 — ≥25%拉黑并撤单，15-25%加入观察名单但不撤单
             if turnover_rate >= MAX_TURNOVER_RATE_BLACKLIST:
                 msg = f'{stock_code} {stock_name} 换手率 {turnover_rate:.2f}% >= {MAX_TURNOVER_RATE_BLACKLIST:.2f}%，撤单'
@@ -670,14 +735,9 @@ def should_cancel(shared_data,
                     logger.warning(msg)
                     send_email(f'【黑名单】{stock_code} {stock_name}', msg)
                 return True
-            elif turnover_rate > MAX_TURNOVER_RATE_THRESHOLD:
-                # 15-25%：加入观察名单，不撤单（允许继续排队）
-                watch_list = shared_data.get('观察名单', {})
-                if stock_code not in blacklist and stock_code not in watch_list:
-                    watch_list[stock_code] = f'{turnover_rate:.1f}%|{time.time()}'
-                    logger.warning(
-                        f'[观察名单] {stock_code} {stock_name} 换手率 {turnover_rate:.1f}% 偏高，加入观察名单'
-                    )
+            elif turnover_rate >= MAX_TURNOVER_RATE_THRESHOLD:
+                _add_to_watchlist(shared_data, blacklist, stock_code, stock_name,
+                                  turnover_rate)
 
             # # --------------------------------- 5. 板块效应判断 -------------------------------- #
             # if (stock_code not in concept_sector_effect
@@ -975,7 +1035,12 @@ def should_sell(shared_data,
                         else:
                             already_triggered = bool(tier_triggered)
                     if not already_triggered:
-                        sell_volume = int(hold_volume * tier_sell_ratio / 100) * 100
+                        target_sell_volume = hold_volume * tier_sell_ratio
+                        sell_volume = int(target_sell_volume / 100) * 100
+                        if sell_volume <= 0 and target_sell_volume > 0 and can_use_volume >= 100:
+                            sell_volume = 100
+                        sell_volume = min(sell_volume, can_use_volume)
+
                         # 合规检验
                         sell_volume = int(min(sell_volume / 100, sum(tick_data['bidVol']))) * 100
                         if sell_volume > 0 and sell_volume <= can_use_volume:
@@ -993,7 +1058,9 @@ def should_sell(shared_data,
                                 '委托备注': f'止盈-{tier_desc}',
                                 '操作原因': msg,
                                 '剩余仓位': can_use_volume - sell_volume,
-                                '快照': tick_data
+                                '快照': tick_data,
+                                '止盈档位': tier_desc,
+                                '止盈收益率': round(profit_ratio, 4),
                             })
                             logger.warning(msg)
                             return True

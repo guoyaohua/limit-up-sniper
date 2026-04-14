@@ -179,7 +179,7 @@ class SharedDataParser:
     def parse_stock_signals(data: Any) -> Dict[str, Dict]:
         """
         解析股票状态信号
-        
+
         Input format:
         {'600051.SH': {'股票状态': {'_type_': 'multiprocessing.Value', '_value_': 1, '_typecode_': 'l'}, ...}}
         """
@@ -208,6 +208,17 @@ class SharedDataParser:
         except Exception as e:
             logger.error(f"解析股票状态信号失败: {e}")
             return {}
+
+    @staticmethod
+    def parse_manager_container(data: Any) -> Any:
+        """解析 multiprocessing.Manager 容器。"""
+        try:
+            if isinstance(data, dict) and '_type_' in data and '_value_' in data:
+                return data['_value_']
+            return data
+        except Exception as e:
+            logger.error(f"解析 Manager 容器失败: {e}")
+            return data
 
     @staticmethod
     def parse_blacklist(data: Any) -> Dict[str, str]:
@@ -306,6 +317,12 @@ class SharedDataParser:
                 '股票状态信号': SharedDataParser.parse_stock_signals,
                 '黑名单': SharedDataParser.parse_blacklist,
                 '强势股票': SharedDataParser.parse_stock_list,
+                '观察名单元数据': SharedDataParser.parse_manager_container,
+                '炸板episode状态': SharedDataParser.parse_manager_container,
+                '盘中特征快照': SharedDataParser.parse_manager_container,
+                '决策原因标签': SharedDataParser.parse_manager_container,
+                '复盘统计计数器': SharedDataParser.parse_manager_container,
+                '盘中事件流': SharedDataParser.parse_manager_container,
             }
 
             for field_name, parser_func in field_parsers.items():
@@ -351,6 +368,12 @@ class SharedDataParser:
             'blacklist': {},
             'stock_features': {},
             'break_statistics': {},
+            'watchlist_metadata': {},
+            'break_episode_state': {},
+            'intraday_snapshots': {},
+            'decision_tags': {},
+            'review_counters': {},
+            'event_buffer': [],
         }
 
         try:
@@ -400,6 +423,12 @@ class SharedDataParser:
 
             # Extract blacklist
             info['blacklist'] = parsed_data.get('黑名单', {})
+            info['watchlist_metadata'] = parsed_data.get('观察名单元数据', {}) or {}
+            info['break_episode_state'] = parsed_data.get('炸板episode状态', {}) or {}
+            info['intraday_snapshots'] = parsed_data.get('盘中特征快照', {}) or {}
+            info['decision_tags'] = parsed_data.get('决策原因标签', {}) or {}
+            info['review_counters'] = parsed_data.get('复盘统计计数器', {}) or {}
+            info['event_buffer'] = parsed_data.get('盘中事件流', []) or []
 
             # Extract break statistics
             max_rebound_time = parsed_data.get('最大开板回封时间', {})

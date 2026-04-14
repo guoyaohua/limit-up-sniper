@@ -13,6 +13,7 @@ This module provides comprehensive post-market analysis with:
 import os
 import sys
 import json
+import html as html_lib
 import pickle
 import re
 import traceback
@@ -37,6 +38,7 @@ from standalone.shared_data_parser import SharedDataParser
 
 # Import email utilities
 from infra.utils import send_email, send_html_email
+from config import TRADE_LOG_DIR as CONFIG_TRADE_LOG_DIR
 
 # Configure logger
 logger.add("logs/post_market_review_enhanced_{time:YYYY-MM-DD}.log",
@@ -57,6 +59,7 @@ class ReviewConfig:
     DATA_BACKUP_DIR = Path("./data_backup")
     LOG_DIR = Path("G:/Logs")
     REPORT_DIR = Path("./reports/review")
+    TRADE_LOG_DIR = Path(CONFIG_TRADE_LOG_DIR)
 
     # Analysis parameters
     MIN_VOLUME_RATIO = 0.7
@@ -108,6 +111,7 @@ class StrategyDecision:
     buy_type: str = "未知"  # '扫板', '排板', '未知'
     buy_reason: str = ""
     gene_data: Dict[str, Any] = field(default_factory=dict)
+    event_context: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -147,6 +151,75 @@ class FilterMetrics:
             self.f1_score = 0.0
 
 
+def _ensure_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _to_event_time(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S'):
+                try:
+                    return datetime.strptime(value, fmt)
+                except ValueError:
+                    continue
+    return None
+
+
+def _json_default(value: Any):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _normalize_reason_tags(reason: Any) -> List[str]:
+    if reason is None:
+        return []
+    if isinstance(reason, list):
+        tags: List[str] = []
+        for item in reason:
+            tags.extend(_normalize_reason_tags(item))
+        return [tag for tag in tags if tag]
+    if isinstance(reason, str):
+        text = reason.strip()
+        if not text:
+            return []
+        if text.startswith('[') and text.endswith(']'):
+            try:
+                parsed = json.loads(text.replace("'", '"'))
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except Exception:
+                pass
+        return [part.strip() for part in re.split(r'[;；、,，\n]+', text) if part.strip()]
+    return [str(reason)]
+
+
+def _unique_keep_order(items: List[Any]) -> List[Any]:
+    result = []
+    seen = set()
+    for item in items:
+        marker = json.dumps(item,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            default=_json_default) if isinstance(item, (dict, list)) else item
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(item)
+    return result
+
+
 # ============================================================================
 # Enhanced Data Collector
 # ============================================================================
@@ -179,7 +252,10 @@ class EnhancedDataCollector:
             'shadow_data': {},
             'metrics': {},
             'log_data': {},
-            'gene_data': {}
+            'gene_data': {},
+            'events': [],
+            'event_summary': {},
+            'review_context': {},
         }
 
         try:
@@ -204,18 +280,22 @@ class EnhancedDataCollector:
             else:
                 logger.error(f"未能加载 {self.date} 的共享数据备份文件")
 
+            events = self._load_trade_events()
+            data['events'] = events
+            data['event_summary'] = self._build_event_summary(events)
+
             # Parse strategy logs
-            log_data = self._parse_comprehensive_logs()
+            log_data = self._parse_comprehensive_logs(events)
             data['log_data'] = log_data
 
             # Categorize market outcomes
             data['market_outcomes'] = self._categorize_market_outcomes(
-                log_data, shared_data_info)
+                log_data, shared_data_info, events)
 
             # Categorize strategy decisions
             data[
                 'strategy_decisions'], approved_stocks, rejected_stocks = self._categorize_strategy_decisions(
-                    log_data, shared_data_info, data['gene_data'])
+                    log_data, shared_data_info, data['gene_data'], events)
 
             # Extract detailed filter information
             data['detailed_filters'] = self._extract_detailed_filters(
@@ -223,6 +303,9 @@ class EnhancedDataCollector:
 
             # Calculate initial metrics
             data['metrics'] = self._calculate_initial_metrics(data)
+
+            # Build deterministic review context
+            data['review_context'] = self._build_review_context(data)
 
             logger.info(
                 f"Data collection complete - {len(data['market_outcomes'])} stocks analyzed"
@@ -253,6 +336,16 @@ class EnhancedDataCollector:
             with open(json_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2, default=str)
             logger.info(f"JSON数据已保存: {json_file}")
+
+            review_context = data.get('review_context') or {}
+            review_context_file = daily_dir / f"review_context_{self.date}.json"
+            with open(review_context_file, 'w', encoding='utf-8') as f:
+                json.dump(review_context,
+                          f,
+                          ensure_ascii=False,
+                          indent=2,
+                          default=_json_default)
+            logger.info(f"Review context 已保存: {review_context_file}")
 
             # # Save as pickle for Python analysis
             # pkl_file = daily_dir / f"review_{self.review_data.date}.pkl"
@@ -301,38 +394,102 @@ class EnhancedDataCollector:
 
     def _load_shared_data(self) -> Optional[Dict]:
         """加载策略共享数据备份文件
-        
+
         根据交易模式选择不同的数据文件:
         - shadow: 影子模式，使用 shadow_shared_data_backup_{date}.pkl
         - live: 实盘模式，使用 shared_data_backup_{date}.pkl
         """
+        # 根据交易模式选择不同的文件名前缀
+        if self.trading_mode == 'live':
+            pattern = f"shared_data_backup_{self.date}*.pkl"
+            mode_desc = "实盘"
+        else:  # shadow mode (default)
+            pattern = f"shadow_shared_data_backup_{self.date}*.pkl"
+            mode_desc = "影子"
+
+        backup_files = list(self.data_dir.glob(pattern))
+
+        if not backup_files:
+            logger.warning(f"未找到 {self.date} 的{mode_desc}数据备份文件, 文件模式: {pattern}，继续使用日志/事件流复盘")
+            return None
+
+        latest_file = max(backup_files, key=lambda p: p.stat().st_mtime)
+
         try:
-            # 根据交易模式选择不同的文件名前缀
-            if self.trading_mode == 'live':
-                pattern = f"shared_data_backup_{self.date}*.pkl"
-                mode_desc = "实盘"
-            else:  # shadow mode (default)
-                pattern = f"shadow_shared_data_backup_{self.date}*.pkl"
-                mode_desc = "影子"
-            
-            backup_files = list(self.data_dir.glob(pattern))
-
-            if not backup_files:
-                logger.error(f"未找到 {self.date} 的{mode_desc}数据备份文件, 文件模式: {pattern}")
-                raise FileNotFoundError(f"未找到 {self.date} 的{mode_desc}数据备份文件")
-
-            latest_file = max(backup_files, key=lambda p: p.stat().st_mtime)
-
             with open(latest_file, 'rb') as f:
                 data = pickle.load(f)
                 logger.info(f"已加载{mode_desc}数据: {latest_file}")
                 return data
-
         except Exception as e:
             logger.exception(f"加载共享数据失败: {e}")
+            return None
+
+    def _load_trade_events(self) -> List[Dict[str, Any]]:
+        """加载按日结构化事件流。"""
+        event_file = ReviewConfig.TRADE_LOG_DIR / self.date / 'events.jsonl'
+        if not event_file.exists():
+            logger.warning(f"事件日志不存在: {event_file}")
+            return []
+
+        events = []
+        try:
+            with open(event_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        events.append(json.loads(line))
+                    except Exception as e:
+                        logger.warning(f"解析事件失败: {e}")
+        except Exception as e:
+            logger.exception(f"读取事件日志失败: {e}")
             raise e
 
-    def _parse_comprehensive_logs(self) -> Dict:
+        logger.info(f"已加载事件 {len(events)} 条: {event_file}")
+        return events
+
+    def _build_event_summary(self, events: List[Dict[str, Any]]) -> Dict[str, Any]:
+        summary = {
+            'candidate_seen': 0,
+            'buy_decision': 0,
+            'cancel_decision': 0,
+            'sell_decision': 0,
+            'watchlist_enter': 0,
+            'watchlist_release': 0,
+            'blacklist_enter': 0,
+            'break_episode_start': 0,
+            'break_episode_end': 0,
+            'limit_up': 0,
+            'order_submitted': 0,
+            'buy_types': defaultdict(int),
+            'sell_triggers': defaultdict(int),
+            'event_count': len(events),
+        }
+
+        for event in events:
+            event_type = event.get('event_type', '')
+            if event_type in summary and isinstance(summary[event_type], int):
+                summary[event_type] += 1
+
+            if event_type == 'buy_decision':
+                summary['buy_types'][event.get('buy_type', '未知')] += 1
+            elif event_type == 'sell_decision':
+                summary['sell_triggers'][event.get('order_remark', '未知')] += 1
+
+        summary['buy_types'] = dict(summary['buy_types'])
+        summary['sell_triggers'] = dict(summary['sell_triggers'])
+        return summary
+
+    def _index_events(self, events: List[Dict[str, Any]]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+        indexed: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
+        for event in events:
+            stock_code = event.get('stock_code') or '__NO_STOCK__'
+            event_type = event.get('event_type', 'unknown')
+            indexed[stock_code][event_type].append(event)
+        return indexed
+
+    def _parse_comprehensive_logs(self, events: Optional[List[Dict[str, Any]]] = None) -> Dict:
         """Parse logs with enhanced extraction"""
         log_data = {
             'pre_market_filters': {},  # {stock_code: [reasons]}
@@ -357,7 +514,7 @@ class EnhancedDataCollector:
             log_files = list(self.log_dir.glob(log_pattern))
 
             if not log_files:
-                raise Exception(f"No log files found for {self.date}")
+                logger.warning(f"No log files found for {self.date}, fallback to structured events only")
 
             for log_file in log_files:
                 content = self._read_log_file(log_file)
@@ -390,12 +547,51 @@ class EnhancedDataCollector:
                     details = self._parse_buy_details(content)
                     log_data['buy_details'].update(details)
 
+            if events:
+                event_index = self._index_events(events)
+                for stock_code, event_groups in event_index.items():
+                    if stock_code == '__NO_STOCK__':
+                        continue
+
+                    if stock_code not in log_data['limit_up_list'] and event_groups.get('limit_up'):
+                        log_data['limit_up_list'].append(stock_code)
+                    if stock_code not in log_data['break_list'] and event_groups.get('break_episode_start'):
+                        log_data['break_list'].append(stock_code)
+
+                    buy_events = event_groups.get('buy_decision', [])
+                    if buy_events and stock_code not in log_data['buy_details']:
+                        latest_buy = buy_events[-1]
+                        inferred_buy_type = latest_buy.get('buy_type', '未知')
+                        log_data['buy_details'][stock_code] = {
+                            'type': inferred_buy_type,
+                            'reason': latest_buy.get('reason', ''),
+                        }
+
+                    cancel_events = event_groups.get('cancel_decision', [])
+                    if cancel_events and stock_code not in log_data['cancel_reasons']:
+                        log_data['cancel_reasons'][stock_code] = _unique_keep_order([
+                            event.get('reason', '') for event in cancel_events if event.get('reason')
+                        ])
+
+                    watchlist_events = event_groups.get('watchlist_enter', [])
+                    if watchlist_events and stock_code not in log_data['not_buy_reasons']:
+                        log_data['not_buy_reasons'][stock_code] = _unique_keep_order([
+                            event.get('source', '观察名单') for event in watchlist_events if event.get('source')
+                        ])
+
+            log_data['limit_up_list'] = _unique_keep_order(log_data['limit_up_list'])
+            log_data['first_limit_list'] = _unique_keep_order(log_data['first_limit_list'])
+            log_data['break_list'] = _unique_keep_order(log_data['break_list'])
+
             # Categorize into scan and queue lists
             for stock, detail in log_data['buy_details'].items():
                 if detail['type'] == '扫板':
                     log_data['scan_list'].append(stock)
                 elif detail['type'] == '排板':
                     log_data['queue_list'].append(stock)
+
+            log_data['scan_list'] = _unique_keep_order(log_data['scan_list'])
+            log_data['queue_list'] = _unique_keep_order(log_data['queue_list'])
 
             # logger.info(log_data)
 
@@ -520,9 +716,11 @@ class EnhancedDataCollector:
 
     def _categorize_market_outcomes(
             self, log_data: Dict,
-            shadow_info: Dict) -> Dict[str, StockOutcome]:
+            shadow_info: Dict,
+            events: Optional[List[Dict[str, Any]]] = None) -> Dict[str, StockOutcome]:
         """Categorize stocks by market outcome"""
         outcomes = {}
+        event_index = self._index_events(events or [])
 
         # Get limit-up stocks from log data
         limit_up_stocks = set(log_data.get('limit_up_list', []))
@@ -530,49 +728,99 @@ class EnhancedDataCollector:
         # Get broken board stocks from log data
         break_stocks = set(log_data.get('break_list', []))
 
-        # Ensure mutual exclusivity
-        if not limit_up_stocks.isdisjoint(break_stocks):
-            logger.error(
-                f"Conflicting stocks found in limit-up and broken board lists: {limit_up_stocks & break_stocks}"
-            )
-            raise ValueError(
-                "Stocks cannot be both limit-up and broken board simultaneously"
-            )
+        for stock_code, groups in event_index.items():
+            if stock_code == '__NO_STOCK__':
+                continue
+            if groups.get('limit_up'):
+                limit_up_stocks.add(stock_code)
+            if groups.get('break_episode_start'):
+                break_stocks.add(stock_code)
+
+        # Ensure mutual exclusivity using event end state when available
+        overlapping = limit_up_stocks & break_stocks
+        for stock_code in list(overlapping):
+            if event_index.get(stock_code, {}).get('break_episode_end') or \
+                    (shadow_info and stock_code in shadow_info.get('limit_up_stocks', {})):
+                break_stocks.discard(stock_code)
+            else:
+                limit_up_stocks.discard(stock_code)
 
         # Create outcome objects
         for stock in limit_up_stocks:
+            outcome_groups = event_index.get(stock, {})
             outcomes[stock] = StockOutcome(
                 stock_code=stock,
                 outcome_type='limit_up',
                 limit_time=shadow_info.get('limit_up_stocks', {}).get(
-                    stock, {}).get('times', []) if shadow_info else [],
+                    stock, {}).get('times', []) if shadow_info else [
+                        event.get('timestamp') for event in outcome_groups.get('limit_up', [])
+                    ],
                 break_time=shadow_info.get('break_stocks', {}).get(
-                    stock, {}).get('times', []) if shadow_info else [],
+                    stock, {}).get('times', []) if shadow_info else [
+                        event.get('timestamp') for event in outcome_groups.get('break_episode_start', [])
+                    ],
                 seal_success_rate=1.0)
 
         for stock in break_stocks:
+            outcome_groups = event_index.get(stock, {})
             outcomes[stock] = StockOutcome(
                 stock_code=stock,
                 outcome_type='broken_board',
                 limit_time=shadow_info.get('limit_up_stocks', {}).get(
-                    stock, {}).get('times', []) if shadow_info else [],
+                    stock, {}).get('times', []) if shadow_info else [
+                        event.get('timestamp') for event in outcome_groups.get('limit_up', [])
+                    ],
                 break_time=shadow_info.get('break_stocks', {}).get(
-                    stock, {}).get('times', []) if shadow_info else [],
+                    stock, {}).get('times', []) if shadow_info else [
+                        event.get('timestamp') for event in outcome_groups.get('break_episode_start', [])
+                    ],
                 seal_success_rate=0.0)
 
         return outcomes
 
+    def _build_event_context(self,
+                             stock_code: str,
+                             events_by_stock: Dict[str, Dict[str, List[Dict[str, Any]]]]) -> Dict[str, Any]:
+        groups = events_by_stock.get(stock_code, {})
+        buy_events = groups.get('buy_decision', [])
+        cancel_events = groups.get('cancel_decision', [])
+        sell_events = groups.get('sell_decision', [])
+        watchlist_events = groups.get('watchlist_enter', [])
+        blacklist_events = groups.get('blacklist_enter', [])
+        break_events = groups.get('break_episode_start', [])
+
+        return {
+            'buy_event_count': len(buy_events),
+            'cancel_event_count': len(cancel_events),
+            'sell_event_count': len(sell_events),
+            'watchlist_event_count': len(watchlist_events),
+            'blacklist_event_count': len(blacklist_events),
+            'break_event_count': len(break_events),
+            'latest_buy_event': buy_events[-1] if buy_events else None,
+            'latest_cancel_event': cancel_events[-1] if cancel_events else None,
+            'latest_sell_event': sell_events[-1] if sell_events else None,
+            'latest_watchlist_event': watchlist_events[-1] if watchlist_events else None,
+            'latest_blacklist_event': blacklist_events[-1] if blacklist_events else None,
+        }
+
     def _categorize_strategy_decisions(
             self, log_data: Dict, shadow_info: Dict,
-            gene_data: Dict) -> Dict[str, StrategyDecision]:
+            gene_data: Dict,
+            events: Optional[List[Dict[str, Any]]] = None) -> Dict[str, StrategyDecision]:
         """Categorize stocks by strategy decision"""
         decisions = {}
         buy_details = log_data.get('buy_details', {})
+        event_index = self._index_events(events or [])
 
         # Get positions (approved stocks)
         positions = set()
         if shadow_info and 'positions' in shadow_info:
             positions.update(shadow_info['positions'].keys())
+
+        order_submitted = {
+            stock_code for stock_code, groups in event_index.items()
+            if stock_code != '__NO_STOCK__' and groups.get('order_submitted')
+        }
 
         # Get late cancellations (also approved)
         late_cancels = set()
@@ -581,18 +829,22 @@ class EnhancedDataCollector:
                 late_cancels.add(stock)
 
         # All approved stocks
-        approved = positions | late_cancels
+        approved = positions | late_cancels | order_submitted
 
         # Create decision objects for approved stocks
         for stock in approved:
             details = buy_details.get(stock, {})
+            context = self._build_event_context(stock, event_index)
+            latest_buy = context.get('latest_buy_event') or {}
             decisions[stock] = StrategyDecision(
                 stock_code=stock,
                 decision_type='approved',
-                decision_reason='已成交' if stock in positions else '未成交',
-                buy_type=details.get('type', '未知'),
-                buy_reason=details.get('reason', ''),
-                gene_data=gene_data.get(stock, {}))
+                decision_reason='已成交' if stock in positions else '已发单' if stock in order_submitted else '未成交',
+                buy_type=details.get('type', latest_buy.get('buy_type', '未知')),
+                buy_reason=details.get('reason', latest_buy.get('reason', '')),
+                timestamp=_to_event_time(latest_buy.get('timestamp')),
+                gene_data=gene_data.get(stock, {}),
+                event_context=context)
 
         # Get rejected stocks
         rejected = set()
@@ -605,33 +857,33 @@ class EnhancedDataCollector:
                     stock_code=stock,
                     decision_type='rejected',
                     decision_reason=f'盘前过滤: {reason}',
-                    filter_tags=reason,
-                    gene_data=gene_data.get(stock, {}))
+                    filter_tags=_normalize_reason_tags(reason),
+                    gene_data=gene_data.get(stock, {}),
+                    event_context=self._build_event_context(stock, event_index))
 
         # Not buy reasons
-        # 获取黑名单详细原因用于替换通用的"黑名单"标签
         blacklist_reasons = shadow_info.get('blacklist', {}) if shadow_info else {}
-        
+
         for stock, reasons in log_data.get('not_buy_reasons', {}).items():
             if stock not in approved:
                 rejected.add(stock)
                 if stock not in decisions:
-                    # 细化黑名单标签：将"黑名单"替换为具体原因（如"黑名单-开板后跌幅过大"）
                     refined_tags = []
-                    for tag in (reasons if isinstance(reasons, list) else [reasons]):
+                    for tag in _ensure_list(reasons):
                         if tag == '黑名单' and stock in blacklist_reasons:
-                            # 将黑名单原因细化
                             blacklist_detail = blacklist_reasons[stock]
                             refined_tags.append(f'黑名单-{blacklist_detail}')
                         else:
                             refined_tags.append(tag)
-                    
+
+                    refined_tags = _unique_keep_order(_normalize_reason_tags(refined_tags))
                     decisions[stock] = StrategyDecision(
                         stock_code=stock,
                         decision_type='rejected',
                         decision_reason=f'不满足买入条件: {refined_tags}',
                         filter_tags=refined_tags,
-                        gene_data=gene_data.get(stock, {}))
+                        gene_data=gene_data.get(stock, {}),
+                        event_context=self._build_event_context(stock, event_index))
 
         # Non-late cancellations
         for stock, reasons in log_data.get('cancel_reasons', {}).items():
@@ -642,9 +894,42 @@ class EnhancedDataCollector:
                         stock_code=stock,
                         decision_type='rejected',
                         decision_reason='撤单',
-                        filter_tags=reasons
-                        if isinstance(reasons, list) else [reasons],
-                        gene_data=gene_data.get(stock, {}))
+                        filter_tags=_unique_keep_order(_normalize_reason_tags(reasons)),
+                        gene_data=gene_data.get(stock, {}),
+                        event_context=self._build_event_context(stock, event_index))
+
+        for stock_code, groups in event_index.items():
+            if stock_code == '__NO_STOCK__' or stock_code in decisions:
+                continue
+
+            if groups.get('buy_decision') or groups.get('cancel_decision') or groups.get('blacklist_enter') or groups.get('watchlist_enter'):
+                latest_buy = groups.get('buy_decision', [])[-1] if groups.get('buy_decision') else {}
+                latest_cancel = groups.get('cancel_decision', [])[-1] if groups.get('cancel_decision') else {}
+                latest_blacklist = groups.get('blacklist_enter', [])[-1] if groups.get('blacklist_enter') else {}
+                latest_watchlist = groups.get('watchlist_enter', [])[-1] if groups.get('watchlist_enter') else {}
+
+                filter_tags = _unique_keep_order(
+                    _normalize_reason_tags(latest_cancel.get('reason')) +
+                    _normalize_reason_tags(latest_blacklist.get('blacklist_reason')) +
+                    _normalize_reason_tags(latest_watchlist.get('source'))
+                )
+                decision_reason = latest_cancel.get('reason') or latest_blacklist.get('reason') or latest_watchlist.get('reason') or latest_buy.get('reason', '')
+                decision_type = 'approved' if groups.get('order_submitted') else 'rejected'
+
+                decisions[stock_code] = StrategyDecision(
+                    stock_code=stock_code,
+                    decision_type=decision_type,
+                    decision_reason=decision_reason or ('已发单' if decision_type == 'approved' else '事件流拒绝'),
+                    filter_tags=filter_tags,
+                    timestamp=_to_event_time((latest_cancel or latest_blacklist or latest_watchlist or latest_buy).get('timestamp')),
+                    buy_type=latest_buy.get('buy_type', '未知'),
+                    buy_reason=latest_buy.get('reason', ''),
+                    gene_data=gene_data.get(stock_code, {}),
+                    event_context=self._build_event_context(stock_code, event_index))
+                if decision_type == 'approved':
+                    approved.add(stock_code)
+                else:
+                    rejected.add(stock_code)
 
         return decisions, approved, rejected
 
@@ -690,6 +975,15 @@ class EnhancedDataCollector:
             'broken_board_rate': 0.0,
             'success_rate': 0.0,  # 买入成功率
             'first_limit_rate': 0.0,  # 首板率
+            'candidate_count': data.get('event_summary', {}).get('candidate_seen', 0),
+            'buy_decision_count': data.get('event_summary', {}).get('buy_decision', 0),
+            'cancel_decision_count': data.get('event_summary', {}).get('cancel_decision', 0),
+            'sell_decision_count': data.get('event_summary', {}).get('sell_decision', 0),
+            'watchlist_enter_count': data.get('event_summary', {}).get('watchlist_enter', 0),
+            'watchlist_release_count': data.get('event_summary', {}).get('watchlist_release', 0),
+            'blacklist_enter_count': data.get('event_summary', {}).get('blacklist_enter', 0),
+            'order_submitted_count': data.get('event_summary', {}).get('order_submitted', 0),
+            'event_count': data.get('event_summary', {}).get('event_count', 0),
         }
 
         # Count outcomes
@@ -764,6 +1058,171 @@ class EnhancedDataCollector:
         logger.info(f"Initial metrics calculated: {metrics}")
 
         return metrics
+
+    def _build_review_context(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        events = data.get('events', [])
+        event_index = self._index_events(events)
+        decisions = data.get('strategy_decisions', {})
+        market_outcomes = data.get('market_outcomes', {})
+        shared_data = data.get('shared_data', {}) or {}
+
+        candidates = []
+        for stock_code in sorted({
+                stock for stock in event_index.keys() if stock != '__NO_STOCK__'
+        } | set(decisions.keys()) | set(market_outcomes.keys())):
+            groups = event_index.get(stock_code, {})
+            decision = decisions.get(stock_code)
+            outcome = market_outcomes.get(stock_code)
+            stock_features = shared_data.get('stock_features', {}).get(stock_code, {})
+            break_stats = shared_data.get('break_statistics', {}).get(stock_code, {})
+            watch_meta = shared_data.get('watchlist_metadata', {}).get(stock_code, {})
+            episode_state = shared_data.get('break_episode_state', {}).get(stock_code, {})
+            snapshot = shared_data.get('intraday_snapshots', {}).get(stock_code, {})
+            decision_tag = shared_data.get('decision_tags', {}).get(stock_code, {})
+
+            buy_events = groups.get('buy_decision', [])
+            cancel_events = groups.get('cancel_decision', [])
+            sell_events = groups.get('sell_decision', [])
+            blacklist_events = groups.get('blacklist_enter', [])
+            watchlist_enter_events = groups.get('watchlist_enter', [])
+            watchlist_release_events = groups.get('watchlist_release', [])
+            order_events = groups.get('order_submitted', [])
+
+            latest_buy = buy_events[-1] if buy_events else {}
+            latest_cancel = cancel_events[-1] if cancel_events else {}
+            latest_sell = sell_events[-1] if sell_events else {}
+
+            filter_tags = decision.filter_tags if decision else []
+            if not filter_tags:
+                filter_tags = _unique_keep_order(
+                    _normalize_reason_tags(latest_cancel.get('reason')) +
+                    _normalize_reason_tags(decision_tag.get('reason')) +
+                    _normalize_reason_tags(latest_buy.get('reason'))
+                )
+
+            candidates.append({
+                'stock_code': stock_code,
+                'decision_type': decision.decision_type if decision else 'unknown',
+                'decision_reason': decision.decision_reason if decision else '',
+                'buy_type': decision.buy_type if decision else latest_buy.get('buy_type', '未知'),
+                'buy_reason': decision.buy_reason if decision else latest_buy.get('reason', ''),
+                'filter_tags': filter_tags,
+                'outcome_type': outcome.outcome_type if outcome else 'unknown',
+                'event_counts': {
+                    'buy_decision': len(buy_events),
+                    'cancel_decision': len(cancel_events),
+                    'sell_decision': len(sell_events),
+                    'order_submitted': len(order_events),
+                    'watchlist_enter': len(watchlist_enter_events),
+                    'watchlist_release': len(watchlist_release_events),
+                    'blacklist_enter': len(blacklist_events),
+                    'break_episode_start': len(groups.get('break_episode_start', [])),
+                    'break_episode_end': len(groups.get('break_episode_end', [])),
+                },
+                'timestamps': {
+                    'first_limit_up': groups.get('limit_up', [{}])[0].get('timestamp') if groups.get('limit_up') else None,
+                    'last_limit_up': groups.get('limit_up', [{}])[-1].get('timestamp') if groups.get('limit_up') else None,
+                    'latest_buy_decision': latest_buy.get('timestamp'),
+                    'latest_cancel_decision': latest_cancel.get('timestamp'),
+                    'latest_sell_decision': latest_sell.get('timestamp'),
+                },
+                'market_context': {
+                    'market_sentiment': latest_buy.get('market_sentiment') or latest_cancel.get('market_sentiment') or latest_sell.get('market_sentiment'),
+                    'stock_status': stock_features.get('股票状态'),
+                },
+                'features': {
+                    'seal_amount': stock_features.get('封单金额'),
+                    'float_shares': stock_features.get('流通股本'),
+                    'first_limit_time': stock_features.get('首次涨停时间'),
+                    'watchlist_position_ratio': watch_meta.get('position_ratio'),
+                    'watchlist_turnover_rate': watch_meta.get('turnover_rate'),
+                    'break_count': break_stats.get('开板次数'),
+                    'max_break_duration': break_stats.get('最大回封时间'),
+                    'fast_reseal_count': episode_state.get('fast_reseal_count'),
+                    'deep_break_count': episode_state.get('deep_break_count'),
+                    'episode_duration': episode_state.get('episode_duration'),
+                },
+                'latest_snapshot': snapshot,
+                'latest_events': {
+                    'buy': latest_buy,
+                    'cancel': latest_cancel,
+                    'sell': latest_sell,
+                    'blacklist': blacklist_events[-1] if blacklist_events else None,
+                    'watchlist_enter': watchlist_enter_events[-1] if watchlist_enter_events else None,
+                    'watchlist_release': watchlist_release_events[-1] if watchlist_release_events else None,
+                },
+                'gene_data': data.get('gene_data', {}).get(stock_code, {}),
+            })
+
+        dimension_stats = {
+            'buy_type': dict(Counter(item.get('buy_type', '未知') for item in candidates if item.get('buy_type'))),
+            'decision_type': dict(Counter(item.get('decision_type', 'unknown') for item in candidates)),
+            'outcome_type': dict(Counter(item.get('outcome_type', 'unknown') for item in candidates)),
+            'filter_tags': dict(Counter(tag for item in candidates for tag in item.get('filter_tags', []))),
+        }
+
+        watchlist_candidates = [
+            item for item in candidates
+            if (item.get('event_counts', {}) or {}).get('watchlist_enter', 0) > 0
+            or (item.get('features', {}) or {}).get('watchlist_position_ratio') is not None
+        ]
+        blacklist_candidates = [
+            item for item in candidates
+            if (item.get('event_counts', {}) or {}).get('blacklist_enter', 0) > 0
+        ]
+        break_candidates = [
+            item for item in candidates
+            if (item.get('event_counts', {}) or {}).get('break_episode_start', 0) > 0
+            or (item.get('features', {}) or {}).get('break_count') is not None
+        ]
+        break_durations = [
+            (item.get('features', {}) or {}).get('episode_duration')
+            for item in break_candidates
+            if isinstance((item.get('features', {}) or {}).get('episode_duration'), (int, float))
+        ]
+
+        special_control_summary = {
+            'watchlist': {
+                'candidate_count': len(watchlist_candidates),
+                'released_count': sum(1 for item in watchlist_candidates if (item.get('event_counts', {}) or {}).get('watchlist_release', 0) > 0),
+                'limit_up_count': sum(1 for item in watchlist_candidates if item.get('outcome_type') == 'limit_up'),
+                'rejected_limit_up_count': sum(1 for item in watchlist_candidates if item.get('outcome_type') == 'limit_up' and item.get('decision_type') == 'rejected'),
+                'approved_broken_count': sum(1 for item in watchlist_candidates if item.get('outcome_type') == 'broken_board' and item.get('decision_type') == 'approved'),
+            },
+            'blacklist': {
+                'candidate_count': len(blacklist_candidates),
+                'limit_up_count': sum(1 for item in blacklist_candidates if item.get('outcome_type') == 'limit_up'),
+                'rejected_limit_up_count': sum(1 for item in blacklist_candidates if item.get('outcome_type') == 'limit_up' and item.get('decision_type') == 'rejected'),
+            },
+            'break_episode': {
+                'candidate_count': len(break_candidates),
+                'with_reseal_count': sum(1 for item in break_candidates if (item.get('features', {}) or {}).get('fast_reseal_count', 0)),
+                'deep_break_stock_count': sum(1 for item in break_candidates if (item.get('features', {}) or {}).get('deep_break_count', 0)),
+                'avg_duration': round(sum(break_durations) / len(break_durations), 2) if break_durations else 0,
+                'max_duration': max(break_durations) if break_durations else 0,
+            },
+        }
+
+        return {
+            'date': data.get('date'),
+            'summary': {
+                'candidate_count': len(candidates),
+                'event_summary': data.get('event_summary', {}),
+                'metrics': data.get('metrics', {}),
+            },
+            'dimension_stats': dimension_stats,
+            'candidates': candidates,
+            'review_counters': shared_data.get('review_counters', {}),
+            'special_control_summary': special_control_summary,
+            'top_missed_opportunities': [
+                item['stock_code'] for item in candidates
+                if item.get('outcome_type') == 'limit_up' and item.get('decision_type') == 'rejected'
+            ][:20],
+            'avoidable_losses': [
+                item['stock_code'] for item in candidates
+                if item.get('outcome_type') == 'broken_board' and item.get('decision_type') == 'approved'
+            ][:20],
+        }
 
     def _parse_pre_market_filters(self, content: str) -> Dict[str, List[str]]:
         """
@@ -1706,24 +2165,36 @@ class EnhancedReportGenerator:
             {stock_categorization}
         </section>
         
+        <!-- Deterministic Review Context -->
+        <section>
+            <h2>三、结构化事件归因</h2>
+            {deterministic_review}
+        </section>
+
         <!-- Filter Performance -->
         <section>
-            <h2>三、过滤器效果分析</h2>
+            <h2>四、过滤器效果分析</h2>
             <div class="chart-container">
                 <canvas id="filterChart"></canvas>
             </div>
             {filter_analysis}
         </section>
-        
+
         <!-- Missed Opportunities -->
         <section>
-            <h2>四、错失机会分析</h2>
+            <h2>五、错失机会分析</h2>
             {missed_opportunities}
         </section>
-        
+
+        <!-- Avoidable Losses -->
+        <section>
+            <h2>六、可避免损失</h2>
+            {avoidable_losses}
+        </section>
+
         <!-- Detailed Stock Analysis -->
         <section>
-            <h2>五、个股详细分析</h2>
+            <h2>七、个股详细分析</h2>
             <button class="collapsible">点击展开详细数据</button>
             <div class="content">
                 {stock_details}
@@ -1883,8 +2354,10 @@ class EnhancedReportGenerator:
         key_findings = seal_analysis_html + key_findings
 
         stock_categorization = self._generate_stock_categorization()
+        deterministic_review = self._generate_deterministic_review()
         filter_analysis = self._generate_filter_analysis()
         missed_opportunities = self._generate_missed_opportunities()
+        avoidable_losses = self._generate_avoidable_losses()
         stock_details = self._generate_stock_details()
         chart_script = self._generate_chart_script()
 
@@ -1904,8 +2377,10 @@ class EnhancedReportGenerator:
             broken_rate=f"{broken_rate:.1f}",
             key_findings=key_findings,
             stock_categorization=stock_categorization,
+            deterministic_review=deterministic_review,
             filter_analysis=filter_analysis,
             missed_opportunities=missed_opportunities,
+            avoidable_losses=avoidable_losses,
             stock_details=stock_details,
             chart_script=chart_script)
 
@@ -1985,6 +2460,429 @@ class EnhancedReportGenerator:
                                 if m.precision > 0.6)
         return (effective_filters /
                 len(filter_metrics)) * 100 if filter_metrics else 0.0
+
+    def _render_dimension_cards(self, stats: Dict[str, Any], label_map: Dict[str, str], tag_class: str = 'info') -> str:
+        """Render dimension statistics as cards."""
+        if not stats:
+            return "<p class='alert alert-info'>暂无结构化统计。</p>"
+
+        cards = []
+        for key, value in sorted(stats.items(), key=lambda item: item[1], reverse=True)[:8]:
+            display = html_lib.escape(str(label_map.get(key, key or '未知')))
+            cards.append(f"""
+            <div class=\"stat-item\">
+                <div class=\"stat-value\">{value}</div>
+                <div class=\"stat-label\"><span class=\"tag {tag_class}\">{display}</span></div>
+            </div>
+            """)
+        return "<div class='stats-summary'>" + ''.join(cards) + "</div>"
+
+    def _render_candidate_table(self, candidates: List[Dict[str, Any]]) -> str:
+        """Render candidate table for deterministic review."""
+        if not candidates:
+            return "<p class='alert alert-info'>暂无候选股明细。</p>"
+
+        rows = []
+        for candidate in candidates[:15]:
+            stock_code = html_lib.escape(str(candidate.get('stock_code', '')))
+            decision_type = html_lib.escape(str(candidate.get('decision_type', '未知')))
+            outcome_type = html_lib.escape(str(candidate.get('outcome_type', '未知')))
+            buy_type = html_lib.escape(str(candidate.get('buy_type', '未知')))
+            filter_tags = candidate.get('filter_tags', []) or []
+            tags_html = ''.join(
+                f'<span class="tag warning">{html_lib.escape(str(tag))}</span>'
+                for tag in filter_tags[:4]) or '<span class="tag default">无</span>'
+            event_counts = candidate.get('event_counts', {}) or {}
+            event_summary = '/'.join([
+                f"候选{event_counts.get('candidate_seen', 0)}",
+                f"买入{event_counts.get('buy_decision', 0)}",
+                f"撤单{event_counts.get('cancel_decision', 0)}",
+                f"卖出{event_counts.get('sell_decision', 0)}",
+            ])
+            rows.append(f"""
+                <tr>
+                    <td><strong>{stock_code}</strong></td>
+                    <td><span class="tag primary">{decision_type}</span></td>
+                    <td><span class="tag info">{outcome_type}</span></td>
+                    <td><span class="tag default">{buy_type}</span></td>
+                    <td>{tags_html}</td>
+                    <td>{html_lib.escape(event_summary)}</td>
+                </tr>
+            """)
+
+        return """
+        <div style="overflow-x:auto;">
+            <table class="auto-layout">
+                <thead>
+                    <tr>
+                        <th>股票</th>
+                        <th>决策</th>
+                        <th>结果</th>
+                        <th>买入类型</th>
+                        <th>标签</th>
+                        <th>事件计数</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """ + ''.join(rows) + """
+                </tbody>
+            </table>
+        </div>
+        """
+
+    def _render_ranked_list(self, items: List[Dict[str, Any]], title: str, empty_text: str) -> str:
+        """Render ranked review items."""
+        html = f"<h4>{html_lib.escape(title)}</h4>"
+        if not items:
+            return html + f"<p class='alert alert-info'>{html_lib.escape(empty_text)}</p>"
+
+        rows = []
+        for idx, item in enumerate(items[:10], 1):
+            stock_code = html_lib.escape(str(item.get('stock_code', '')))
+            score = item.get('impact_score', item.get('loss_score', 0))
+            reason = html_lib.escape(str(item.get('rejection_reason', item.get('decision_reason', ''))))
+            recommendation = html_lib.escape(str(item.get('recommendation', item.get('analysis', '')))).replace('\n', '<br>')
+            tags = item.get('filter_tags', []) or []
+            tags_html = ''.join(
+                f'<span class="tag warning">{html_lib.escape(str(tag))}</span>'
+                for tag in tags[:4]) or '<span class="tag default">无</span>'
+            rows.append(f"""
+                <tr>
+                    <td>{idx}</td>
+                    <td><strong>{stock_code}</strong></td>
+                    <td>{score}</td>
+                    <td>{reason or '-'}</td>
+                    <td>{tags_html}</td>
+                    <td>{recommendation or '-'}</td>
+                </tr>
+            """)
+
+        return html + """
+        <div style="overflow-x:auto;">
+            <table class="auto-layout">
+                <thead>
+                    <tr>
+                        <th>序号</th>
+                        <th>股票</th>
+                        <th>评分</th>
+                        <th>原因</th>
+                        <th>标签</th>
+                        <th>建议</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """ + ''.join(rows) + """
+                </tbody>
+            </table>
+        </div>
+        """
+
+    def _generate_special_control_summary(self, summary: Dict[str, Any]) -> str:
+        """Render summarized special control metrics."""
+        if not summary:
+            return "<p class='alert alert-info'>暂无特殊管控统计摘要。</p>"
+
+        watchlist = summary.get('watchlist', {}) or {}
+        blacklist = summary.get('blacklist', {}) or {}
+        break_episode = summary.get('break_episode', {}) or {}
+
+        return f"""
+        <div class="stats-summary">
+            <div class="stat-item"><div class="stat-value">{watchlist.get('candidate_count', 0)}</div><div class="stat-label">观察名单样本</div></div>
+            <div class="stat-item"><div class="stat-value">{watchlist.get('released_count', 0)}</div><div class="stat-label">观察名单释放数</div></div>
+            <div class="stat-item"><div class="stat-value">{watchlist.get('rejected_limit_up_count', 0)}</div><div class="stat-label">观察名单误伤涨停</div></div>
+            <div class="stat-item"><div class="stat-value">{watchlist.get('approved_broken_count', 0)}</div><div class="stat-label">观察名单后仍炸板</div></div>
+            <div class="stat-item"><div class="stat-value">{blacklist.get('candidate_count', 0)}</div><div class="stat-label">黑名单样本</div></div>
+            <div class="stat-item"><div class="stat-value">{blacklist.get('rejected_limit_up_count', 0)}</div><div class="stat-label">黑名单误伤涨停</div></div>
+            <div class="stat-item"><div class="stat-value">{break_episode.get('candidate_count', 0)}</div><div class="stat-label">炸板样本</div></div>
+            <div class="stat-item"><div class="stat-value">{break_episode.get('with_reseal_count', 0)}</div><div class="stat-label">快速回封样本</div></div>
+            <div class="stat-item"><div class="stat-value">{break_episode.get('deep_break_stock_count', 0)}</div><div class="stat-label">深炸样本</div></div>
+            <div class="stat-item"><div class="stat-value">{break_episode.get('avg_duration', 0)}</div><div class="stat-label">平均炸板时长</div></div>
+            <div class="stat-item"><div class="stat-value">{break_episode.get('max_duration', 0)}</div><div class="stat-label">最大炸板时长</div></div>
+        </div>
+        """
+
+    def _generate_special_control_diagnostics(self, summary: Dict[str, Any]) -> str:
+        """Render conclusion-style diagnostics for watchlist, blacklist and break episodes."""
+        if not summary:
+            return "<p class='alert alert-info'>暂无特殊管控诊断结论。</p>"
+
+        watchlist = summary.get('watchlist', {}) or {}
+        blacklist = summary.get('blacklist', {}) or {}
+        break_episode = summary.get('break_episode', {}) or {}
+
+        def safe_ratio(numerator: Any, denominator: Any) -> float:
+            try:
+                numerator_value = float(numerator or 0)
+                denominator_value = float(denominator or 0)
+                if denominator_value <= 0:
+                    return 0.0
+                return numerator_value / denominator_value
+            except (TypeError, ValueError):
+                return 0.0
+
+        diagnostics = []
+
+        watchlist_count = int(watchlist.get('candidate_count', 0) or 0)
+        watchlist_false_reject_ratio = safe_ratio(watchlist.get('rejected_limit_up_count', 0), watchlist_count)
+        watchlist_broken_ratio = safe_ratio(watchlist.get('approved_broken_count', 0), watchlist_count)
+        released_ratio = safe_ratio(watchlist.get('released_count', 0), watchlist_count)
+        if watchlist_count <= 0:
+            diagnostics.append(('info', '观察名单', '暂无观察名单样本，当前无法判断观察名单阈值是否偏严或释放是否及时。'))
+        elif watchlist_false_reject_ratio >= 0.3:
+            diagnostics.append(('warning', '观察名单偏严', f"观察名单样本 {watchlist_count} 只中，误伤涨停 {watchlist.get('rejected_limit_up_count', 0)} 只，占比 {watchlist_false_reject_ratio:.0%}。建议优先复核观察名单换手阈值与释放条件。"))
+        elif watchlist_broken_ratio >= 0.5 and released_ratio < 0.3:
+            diagnostics.append(('warning', '观察名单释放偏慢', f"观察名单样本里，后续仍炸板 {watchlist.get('approved_broken_count', 0)} 只，占比 {watchlist_broken_ratio:.0%}；释放数 {watchlist.get('released_count', 0)} 较少。更像是名单持续压制但没有形成有效分流，建议复核自动释放逻辑。"))
+        else:
+            diagnostics.append(('success', '观察名单表现可控', f"观察名单样本 {watchlist_count} 只，误伤涨停 {watchlist.get('rejected_limit_up_count', 0)} 只，释放 {watchlist.get('released_count', 0)} 只。当前更适合继续观察，不建议仅凭单日样本大改阈值。"))
+
+        blacklist_count = int(blacklist.get('candidate_count', 0) or 0)
+        blacklist_false_reject_ratio = safe_ratio(blacklist.get('rejected_limit_up_count', 0), blacklist_count)
+        if blacklist_count <= 0:
+            diagnostics.append(('info', '黑名单', '暂无黑名单样本，当前无法判断黑名单规则是否过严。'))
+        elif blacklist_false_reject_ratio >= 0.25:
+            diagnostics.append(('warning', '黑名单可能误杀', f"黑名单样本 {blacklist_count} 只中，误伤涨停 {blacklist.get('rejected_limit_up_count', 0)} 只，占比 {blacklist_false_reject_ratio:.0%}。建议把部分硬拒绝改成先降级评分或缩仓观察。"))
+        else:
+            diagnostics.append(('success', '黑名单暂未显示过严', f"黑名单样本 {blacklist_count} 只，误伤涨停 {blacklist.get('rejected_limit_up_count', 0)} 只。当前更像是在拦截高风险样本，可继续积累多日统计后再调。"))
+
+        break_count = int(break_episode.get('candidate_count', 0) or 0)
+        reseal_ratio = safe_ratio(break_episode.get('with_reseal_count', 0), break_count)
+        deep_break_ratio = safe_ratio(break_episode.get('deep_break_stock_count', 0), break_count)
+        avg_duration = break_episode.get('avg_duration', 0) or 0
+        max_duration = break_episode.get('max_duration', 0) or 0
+        if break_count <= 0:
+            diagnostics.append(('info', '炸板 episode', '暂无炸板 episode 样本，当前无法判断回封质量规则是否需要调整。'))
+        elif reseal_ratio >= 0.5 and deep_break_ratio < 0.3:
+            diagnostics.append(('warning', '炸板后回封占比较高', f"炸板样本 {break_count} 只中，快速回封 {break_episode.get('with_reseal_count', 0)} 只，占比 {reseal_ratio:.0%}，深炸仅 {break_episode.get('deep_break_stock_count', 0)} 只。建议优先考虑缩仓或观察名单，而不是一刀切拒绝。"))
+        elif deep_break_ratio >= 0.4 or avg_duration >= 300:
+            diagnostics.append(('warning', '炸板样本偏弱', f"炸板样本 {break_count} 只中，深炸 {break_episode.get('deep_break_stock_count', 0)} 只，占比 {deep_break_ratio:.0%}；平均时长 {avg_duration} 秒，最长 {max_duration} 秒。说明炸板后承接偏弱，当前严格控制仍有必要。"))
+        else:
+            diagnostics.append(('success', '炸板规则可继续观察', f"炸板样本 {break_count} 只，快速回封 {break_episode.get('with_reseal_count', 0)} 只，深炸 {break_episode.get('deep_break_stock_count', 0)} 只，平均时长 {avg_duration} 秒。短期更适合继续累计样本后再调回封参与规则。"))
+
+        blocks = []
+        for level, title, message in diagnostics:
+            blocks.append(
+                f"<div class='alert alert-{level}'><strong>{html_lib.escape(title)}</strong>：{html_lib.escape(message)}</div>"
+            )
+        return ''.join(blocks)
+
+    def _generate_special_control_attribution(self, candidates: List[Dict[str, Any]]) -> str:
+        """Render watchlist, blacklist and break-episode attribution."""
+        special_candidates = []
+        for candidate in candidates:
+            event_counts = candidate.get('event_counts', {}) or {}
+            features = candidate.get('features', {}) or {}
+            if any([
+                    event_counts.get('watchlist_enter', 0),
+                    event_counts.get('watchlist_release', 0),
+                    event_counts.get('blacklist_enter', 0),
+                    event_counts.get('break_episode_start', 0),
+                    event_counts.get('break_episode_end', 0),
+                    features.get('break_count'),
+                    features.get('episode_duration'),
+                    features.get('fast_reseal_count'),
+                    features.get('deep_break_count')
+            ]):
+                special_candidates.append(candidate)
+
+        if not special_candidates:
+            return "<p class='alert alert-info'>暂无观察名单、黑名单或炸板 episode 归因样本。</p>"
+
+        watchlist_count = sum(1 for c in special_candidates if (c.get('event_counts', {}) or {}).get('watchlist_enter', 0) > 0)
+        released_count = sum(1 for c in special_candidates if (c.get('event_counts', {}) or {}).get('watchlist_release', 0) > 0)
+        blacklist_count = sum(1 for c in special_candidates if (c.get('event_counts', {}) or {}).get('blacklist_enter', 0) > 0)
+        break_count = sum(1 for c in special_candidates if ((c.get('event_counts', {}) or {}).get('break_episode_start', 0) > 0 or (c.get('features', {}) or {}).get('break_count')))
+
+        rows = []
+        for candidate in special_candidates[:20]:
+            stock_code = html_lib.escape(str(candidate.get('stock_code', '')))
+            decision_type = html_lib.escape(str(candidate.get('decision_type', '未知')))
+            outcome_type = html_lib.escape(str(candidate.get('outcome_type', '未知')))
+            event_counts = candidate.get('event_counts', {}) or {}
+            features = candidate.get('features', {}) or {}
+
+            watch_ratio = features.get('watchlist_position_ratio')
+            watch_turnover = features.get('watchlist_turnover_rate')
+            break_duration = features.get('episode_duration') or features.get('max_break_duration')
+
+            rows.append(f"""
+                <tr>
+                    <td><strong>{stock_code}</strong></td>
+                    <td><span class="tag primary">{decision_type}</span></td>
+                    <td><span class="tag info">{outcome_type}</span></td>
+                    <td>{event_counts.get('watchlist_enter', 0)}/{event_counts.get('watchlist_release', 0)}</td>
+                    <td>{watch_ratio if watch_ratio is not None else '-'}</td>
+                    <td>{watch_turnover if watch_turnover is not None else '-'}</td>
+                    <td>{event_counts.get('blacklist_enter', 0)}</td>
+                    <td>{event_counts.get('break_episode_start', 0)}/{event_counts.get('break_episode_end', 0)}</td>
+                    <td>{features.get('break_count', '-')}</td>
+                    <td>{break_duration if break_duration is not None else '-'}</td>
+                    <td>{features.get('fast_reseal_count', '-')}</td>
+                    <td>{features.get('deep_break_count', '-')}</td>
+                </tr>
+            """)
+
+        return f"""
+        <div class="stats-summary">
+            <div class="stat-item"><div class="stat-value">{len(special_candidates)}</div><div class="stat-label">特殊管控样本</div></div>
+            <div class="stat-item"><div class="stat-value">{watchlist_count}</div><div class="stat-label">观察名单样本</div></div>
+            <div class="stat-item"><div class="stat-value">{released_count}</div><div class="stat-label">已释放样本</div></div>
+            <div class="stat-item"><div class="stat-value">{blacklist_count}</div><div class="stat-label">黑名单样本</div></div>
+            <div class="stat-item"><div class="stat-value">{break_count}</div><div class="stat-label">炸板 episode 样本</div></div>
+        </div>
+        <div style="overflow-x:auto;">
+            <table class="auto-layout">
+                <thead>
+                    <tr>
+                        <th>股票</th>
+                        <th>决策</th>
+                        <th>结果</th>
+                        <th>观察名单 进/出</th>
+                        <th>缩仓比例</th>
+                        <th>观察换手率</th>
+                        <th>黑名单</th>
+                        <th>炸板 开/闭</th>
+                        <th>开板次数</th>
+                        <th>持续时长</th>
+                        <th>快速回封</th>
+                        <th>深炸次数</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {''.join(rows)}
+                </tbody>
+            </table>
+        </div>
+        """
+
+    def _generate_deterministic_review(self) -> str:
+        """Generate deterministic event-attribution review section."""
+        review_context = self.data.get('review_context', {}) or {}
+        summary = review_context.get('summary', {}) or {}
+        event_summary = summary.get('event_summary', {}) or self.data.get('event_summary', {}) or {}
+        metrics = summary.get('metrics', {}) or self.data.get('metrics', {}) or {}
+        dimension_stats = review_context.get('dimension_stats', {}) or {}
+        candidates = review_context.get('candidates', []) or []
+        review_counters = review_context.get('review_counters', {}) or {}
+
+        funnel_cards = f"""
+        <div class="stats-summary">
+            <div class="stat-item"><div class="stat-value">{event_summary.get('candidate_seen', 0)}</div><div class="stat-label">候选事件</div></div>
+            <div class="stat-item"><div class="stat-value">{event_summary.get('buy_decision', 0)}</div><div class="stat-label">买入决策</div></div>
+            <div class="stat-item"><div class="stat-value">{event_summary.get('order_submitted', 0)}</div><div class="stat-label">发单事件</div></div>
+            <div class="stat-item"><div class="stat-value">{event_summary.get('cancel_decision', 0)}</div><div class="stat-label">撤单决策</div></div>
+            <div class="stat-item"><div class="stat-value">{event_summary.get('sell_decision', 0)}</div><div class="stat-label">卖出决策</div></div>
+            <div class="stat-item"><div class="stat-value">{event_summary.get('watchlist_enter', 0)}/{event_summary.get('watchlist_release', 0)}</div><div class="stat-label">观察名单进/出</div></div>
+            <div class="stat-item"><div class="stat-value">{event_summary.get('blacklist_enter', 0)}</div><div class="stat-label">黑名单事件</div></div>
+            <div class="stat-item"><div class="stat-value">{event_summary.get('break_episode_start', 0)}/{event_summary.get('break_episode_end', 0)}</div><div class="stat-label">炸板 episode 开/闭</div></div>
+        </div>
+        """
+
+        buy_type_cards = self._render_dimension_cards(
+            dimension_stats.get('buy_type', {}), {'排板': '排板', '扫板': '扫板', '未知': '未知'}, 'info')
+        decision_cards = self._render_dimension_cards(
+            dimension_stats.get('decision_type', {}), {'approved': '买入', 'rejected': '拒绝', 'unknown': '未知'}, 'primary')
+        outcome_cards = self._render_dimension_cards(
+            dimension_stats.get('outcome_type', {}), {'limit_up': '涨停', 'broken_board': '炸板', 'normal': '普通', 'unknown': '未知'}, 'success')
+        filter_cards = self._render_dimension_cards(dimension_stats.get('filter_tags', {}), {}, 'warning')
+
+        review_counter_html = ""
+        if review_counters:
+            review_counter_html = self._render_dimension_cards(review_counters, {}, 'default')
+        else:
+            review_counter_html = "<p class='alert alert-info'>暂无复盘计数器。</p>"
+
+        special_control_summary = review_context.get('special_control_summary', {}) or {}
+        special_control_summary_html = self._generate_special_control_summary(special_control_summary)
+        special_control_diagnostics_html = self._generate_special_control_diagnostics(special_control_summary)
+        candidate_table = self._render_candidate_table(candidates)
+        special_control_html = self._generate_special_control_attribution(candidates)
+        deterministic_missed = self._render_ranked_list(
+            self._build_stock_code_review_items(review_context.get('top_missed_opportunities', []) or [], 'missed'),
+            '结构化错失机会 Top',
+            '暂无结构化错失机会。')
+        deterministic_losses = self._render_ranked_list(
+            self._build_stock_code_review_items(review_context.get('avoidable_losses', []) or [], 'loss'),
+            '结构化可避免损失 Top',
+            '暂无结构化可避免损失。')
+
+        return f"""
+        <div class="alert alert-info">
+            结构化事件总数 <strong>{event_summary.get('event_count', 0)}</strong>，候选股 <strong>{len(candidates)}</strong>，
+            策略买入 <strong>{metrics.get('strategy_bought', 0)}</strong>，策略拒绝 <strong>{metrics.get('strategy_rejected', 0)}</strong>。
+        </div>
+        <h4>事件漏斗</h4>
+        {funnel_cards}
+        <h4>决策维度分布</h4>
+        <div class="stats-summary" style="display:block; padding:12px 15px;">
+            <div><strong>买入类型</strong></div>
+            {buy_type_cards}
+            <div><strong>决策类型</strong></div>
+            {decision_cards}
+            <div><strong>结果类型</strong></div>
+            {outcome_cards}
+            <div><strong>过滤标签 Top</strong></div>
+            {filter_cards}
+        </div>
+        <h4>特殊管控统计摘要</h4>
+        {special_control_summary_html}
+        <h4>特殊管控结论提示</h4>
+        {special_control_diagnostics_html}
+        <h4>候选股归因样本</h4>
+        {candidate_table}
+        <h4>观察名单 / 黑名单 / 炸板 episode 归因</h4>
+        {special_control_html}
+        <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 20px; align-items:start;">
+            <div>{deterministic_missed}</div>
+            <div>{deterministic_losses}</div>
+        </div>
+        <h4>复盘计数器</h4>
+        {review_counter_html}
+        """
+
+    def _build_stock_code_review_items(self, stock_codes: List[str], item_type: str) -> List[Dict[str, Any]]:
+        """Build review items from stock code lists in review_context."""
+        decisions = self.data.get('strategy_decisions', {}) or {}
+        outcomes = self.data.get('market_outcomes', {}) or {}
+        review_context = self.data.get('review_context', {}) or {}
+        candidates = {
+            item.get('stock_code'): item
+            for item in review_context.get('candidates', []) or []
+            if item.get('stock_code')
+        }
+
+        items = []
+        for idx, stock_code in enumerate(stock_codes, 1):
+            decision = decisions.get(stock_code)
+            outcome = outcomes.get(stock_code)
+            candidate = candidates.get(stock_code, {})
+            filter_tags = []
+            if decision and getattr(decision, 'filter_tags', None):
+                filter_tags = list(decision.filter_tags)
+            elif candidate.get('filter_tags'):
+                filter_tags = list(candidate.get('filter_tags', []))
+
+            if item_type == 'missed':
+                recommendation = '复核拒绝条件，确认是否存在过滤过严或边界误伤。'
+                reason = getattr(decision, 'decision_reason', '') if decision else candidate.get('decision_reason', '')
+                score_key = 'impact_score'
+            else:
+                recommendation = '复核买入、撤单与卖出链路，确认是否可提前规避炸板。'
+                reason = getattr(decision, 'buy_reason', '') if decision else candidate.get('decision_reason', '')
+                score_key = 'loss_score'
+
+            if not reason and outcome is not None:
+                reason = getattr(outcome, 'outcome_type', '')
+
+            items.append({
+                'stock_code': stock_code,
+                score_key: len(stock_codes) - idx + 1,
+                'decision_reason': reason,
+                'filter_tags': filter_tags,
+                'recommendation': recommendation,
+            })
+
+        return items
 
     def _generate_key_findings(self) -> str:
         """Generate key findings section"""
@@ -2464,6 +3362,13 @@ class EnhancedReportGenerator:
         """
 
         return html
+
+    def _generate_avoidable_losses(self) -> str:
+        """Generate avoidable losses section from deterministic review context."""
+        review_context = self.data.get('review_context', {}) or {}
+        avoidable_stock_codes = review_context.get('avoidable_losses', []) or []
+        items = self._build_stock_code_review_items(avoidable_stock_codes, 'loss')
+        return self._render_ranked_list(items, '可避免损失样本', '暂无可避免损失样本。')
 
     def _generate_missed_opportunities(self) -> str:
         """Generate missed opportunities section with gene details in separate columns"""
@@ -3036,6 +3941,8 @@ class EnhancedReportGenerator:
         json_data = {
             'date': self.data['date'],
             'metrics': self.data.get('metrics', {}),
+            'event_summary': self.data.get('event_summary', {}),
+            'review_context': self.data.get('review_context', {}),
             'filter_metrics': {
                 k: asdict(v)
                 for k, v in self.analysis.get('filter_metrics', {}).items()

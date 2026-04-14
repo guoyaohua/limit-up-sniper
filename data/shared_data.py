@@ -119,6 +119,12 @@ def init_shared_data(stock_pool,
                     ('开板次数', 'dict'),
                     ('黑名单', 'dict'),
                     ('观察名单', 'dict'),
+                    ('观察名单元数据', 'dict'),
+                    ('炸板episode状态', 'dict'),
+                    ('盘中特征快照', 'dict'),
+                    ('决策原因标签', 'dict'),
+                    ('复盘统计计数器', 'dict'),
+                    ('盘中事件流', 'list'),
                     ('板块优先级', 'dict'),
                 ]
 
@@ -191,6 +197,12 @@ def init_shared_data(stock_pool,
                     '市场情绪_评分': Value('d', 0),  # 市场情绪评分
                     '黑名单': manager_proxies['黑名单'],  # 股票代码 -> 黑名单原因
                     '观察名单': manager_proxies['观察名单'],  # 股票代码 -> 观察名单信息
+                    '观察名单元数据': manager_proxies['观察名单元数据'],  # 股票代码 -> 观察名单结构化元数据
+                    '炸板episode状态': manager_proxies['炸板episode状态'],  # 股票代码 -> 炸板episode结构化状态
+                    '盘中特征快照': manager_proxies['盘中特征快照'],  # 股票代码 -> 最近一次结构化事件/特征快照
+                    '决策原因标签': manager_proxies['决策原因标签'],  # 股票代码 -> 最近一次决策标签
+                    '复盘统计计数器': manager_proxies['复盘统计计数器'],  # 统计计数器
+                    '盘中事件流': manager_proxies['盘中事件流'],  # 盘中事件缓冲区
                     '板块优先级': manager_proxies['板块优先级'],  # LLM盘前板块预判结果
                     '强势股票': strong_stocks,  # 强势股票列表, 涨停基因好的股票
                     '撤单次数': Value('i', 0),  # 撤单次数
@@ -251,6 +263,12 @@ def init_shared_data(stock_pool,
                     ('开板次数', 'dict'),
                     ('黑名单', 'dict'),
                     ('观察名单', 'dict'),
+                    ('观察名单元数据', 'dict'),
+                    ('炸板episode状态', 'dict'),
+                    ('盘中特征快照', 'dict'),
+                    ('决策原因标签', 'dict'),
+                    ('复盘统计计数器', 'dict'),
+                    ('盘中事件流', 'list'),
                     ('板块优先级', 'dict'),
                 ]
 
@@ -319,6 +337,12 @@ def init_shared_data(stock_pool,
                     '市场情绪_评分': base_shared_data['市场情绪_评分'],  # 市场情绪评分
                     '黑名单': shadow_manager_proxies['黑名单'],  # 股票代码 -> 黑名单原因
                     '观察名单': shadow_manager_proxies['观察名单'],  # 股票代码 -> 观察名单信息
+                    '观察名单元数据': shadow_manager_proxies['观察名单元数据'],  # 股票代码 -> 观察名单结构化元数据
+                    '炸板episode状态': shadow_manager_proxies['炸板episode状态'],  # 股票代码 -> 炸板episode结构化状态
+                    '盘中特征快照': shadow_manager_proxies['盘中特征快照'],  # 股票代码 -> 最近一次结构化事件/特征快照
+                    '决策原因标签': shadow_manager_proxies['决策原因标签'],  # 股票代码 -> 最近一次决策标签
+                    '复盘统计计数器': shadow_manager_proxies['复盘统计计数器'],  # 统计计数器
+                    '盘中事件流': shadow_manager_proxies['盘中事件流'],  # 盘中事件缓冲区
                     '板块优先级': shadow_manager_proxies['板块优先级'],  # LLM盘前板块预判结果
                     '强势股票': strong_stocks,  # 强势股票列表, 涨停基因好的股票
                     '撤单次数': Value('i', 0),  # 撤单次数

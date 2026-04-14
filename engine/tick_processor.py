@@ -20,6 +20,7 @@ from config import (
     LATENCY_THRESHOLD,
     MAX_UP_LIMIT_BREAK_COUNT, MAX_UP_LIMIT_BREAK_TIME,
     MAX_CANCEL_COUNT,
+    WATCHLIST_RELEASE_MINUTES, WATCHLIST_RELEASE_TURNOVER,
 )
 from infra.common_enums import (
     OrderType, StockOrderStatusInt, StockLimitStatusInt,
@@ -32,6 +33,7 @@ from infra.data_helpers import (
 from infra.task_manager import CallbackHeartbeatMonitor
 from core.decisions import should_buy, should_cancel, should_sell
 from core.trailing_stop import calculate_trailing_stop_prices
+from infra.trade_log import record_strategy_event
 
 
 # 全局回调心跳监控器（用于监控 xtdata 回调是否正常）
@@ -177,6 +179,183 @@ def check_order_successed(shared_data,
     return False
 
 
+def _increment_review_counter(counter_dict, key, step=1):
+    """累计复盘计数器。"""
+    if counter_dict is None:
+        return
+    counter_dict[key] = counter_dict.get(key, 0) + step
+
+
+
+def _update_decision_tag(decision_tags, stock_code, decision, reason, extra=None):
+    """更新最近一次决策标签。"""
+    if decision_tags is None:
+        return
+    payload = {
+        'decision': decision,
+        'reason': reason,
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f'),
+    }
+    if extra:
+        payload.update(extra)
+    decision_tags[stock_code] = payload
+
+
+
+def _check_watchlist_release(shared_data,
+                             stock_code,
+                             tick_data,
+                             stock_info,
+                             watch_list,
+                             watchlist_metadata,
+                             decision_tags,
+                             review_counters):
+    """检查观察名单自动释放。"""
+    if stock_code not in watch_list:
+        return
+
+    metadata = watchlist_metadata.get(stock_code, {}) if watchlist_metadata is not None else {}
+    entry_timestamp = metadata.get('enter_timestamp')
+    if entry_timestamp is None:
+        try:
+            parts = str(watch_list[stock_code]).split('|')
+            entry_timestamp = float(parts[1]) if len(parts) == 2 else None
+        except Exception:
+            entry_timestamp = None
+
+    if entry_timestamp is None:
+        return
+
+    elapsed_minutes = (time.time() - entry_timestamp) / 60
+    float_shares = stock_info.get('流通股本', 0)
+    turnover_rate = tick_data.get('pvolume', 0) / float_shares * 100 if float_shares else 0
+
+    if elapsed_minutes < WATCHLIST_RELEASE_MINUTES or turnover_rate < WATCHLIST_RELEASE_TURNOVER:
+        return
+
+    stock_name = stock_info['股票名称']
+    watch_list.pop(stock_code, None)
+    if watchlist_metadata is not None:
+        watchlist_metadata.pop(stock_code, None)
+
+    reason = (
+        f'观察名单释放：已观察{elapsed_minutes:.1f}分钟，换手率恢复至{turnover_rate:.1f}%'
+    )
+    _update_decision_tag(
+        decision_tags,
+        stock_code,
+        'watchlist_release',
+        reason,
+        extra={
+            'elapsed_minutes': round(elapsed_minutes, 2),
+            'turnover_rate': round(turnover_rate, 4),
+        })
+    _increment_review_counter(review_counters, 'watchlist_release_count')
+    record_strategy_event(
+        shared_data,
+        event_type='watchlist_release',
+        stock_code=stock_code,
+        stock_name=stock_name,
+        reason=reason,
+        snapshot=tick_data,
+        extra={
+            'elapsed_minutes': round(elapsed_minutes, 2),
+            'turnover_rate': round(turnover_rate, 4),
+        })
+    logger.info(f'[观察名单解除] {stock_code} {stock_name} {reason}')
+
+
+
+def _start_break_episode(shared_data,
+                         stock_code,
+                         stock_info,
+                         tick_data,
+                         break_episode_state,
+                         review_counters):
+    """开始新的炸板 episode。"""
+    if break_episode_state is None:
+        return
+
+    episode = break_episode_state.get(stock_code, {})
+    start_ts = tick_data['time']
+    episode.update({
+        'stock_name': stock_info['股票名称'],
+        'first_limit_time': episode.get('first_limit_time'),
+        'last_limit_time': episode.get('last_limit_time'),
+        'episode_start': start_ts,
+        'episode_end': None,
+        'last_break_time': start_ts,
+        'last_reseal_time': episode.get('last_reseal_time'),
+        'episode_duration': 0,
+        'fast_reseal_count': episode.get('fast_reseal_count', 0),
+        'deep_break_count': episode.get('deep_break_count', 0),
+        'break_count': episode.get('break_count', 0) + 1,
+        'is_active': True,
+    })
+
+    limit_price = stock_info['涨停价']
+    drawdown = 0.0
+    if limit_price:
+        drawdown = max(0.0, (limit_price - tick_data['lastPrice']) / limit_price)
+    if drawdown >= 0.03:
+        episode['deep_break_count'] = episode.get('deep_break_count', 0) + 1
+
+    break_episode_state[stock_code] = episode
+    _increment_review_counter(review_counters, 'break_episode_start_count')
+    record_strategy_event(
+        shared_data,
+        event_type='break_episode_start',
+        stock_code=stock_code,
+        stock_name=stock_info['股票名称'],
+        reason='涨停打开，开始记录炸板 episode',
+        snapshot=tick_data,
+        extra={
+            'break_count': episode['break_count'],
+            'deep_break_count': episode['deep_break_count'],
+            'drawdown_from_limit': round(drawdown, 4),
+        })
+
+
+
+def _finish_break_episode(shared_data,
+                          stock_code,
+                          stock_info,
+                          tick_data,
+                          break_episode_state,
+                          review_counters):
+    """结束炸板 episode。"""
+    if break_episode_state is None or stock_code not in break_episode_state:
+        return None
+
+    episode = dict(break_episode_state.get(stock_code, {}))
+    if not episode.get('episode_start'):
+        return episode
+
+    duration = _calc_limit_up_break_duration(tick_data['time'], episode['episode_start'])
+    episode['episode_end'] = tick_data['time']
+    episode['episode_duration'] = duration
+    episode['last_reseal_time'] = tick_data['time']
+    episode['is_active'] = False
+    if duration <= 60:
+        episode['fast_reseal_count'] = episode.get('fast_reseal_count', 0) + 1
+
+    break_episode_state[stock_code] = episode
+    _increment_review_counter(review_counters, 'break_episode_end_count')
+    record_strategy_event(
+        shared_data,
+        event_type='break_episode_end',
+        stock_code=stock_code,
+        stock_name=stock_info['股票名称'],
+        reason=f'回封完成，开板时长 {int(duration)} 秒',
+        snapshot=tick_data,
+        extra={
+            'duration_seconds': int(duration),
+            'fast_reseal_count': episode.get('fast_reseal_count', 0),
+            'deep_break_count': episode.get('deep_break_count', 0),
+        })
+    return episode
+
+
 # ---------------------------------------------------------------------------- #
 #                           process_tick_data 处理循环                           #
 # ---------------------------------------------------------------------------- #
@@ -207,6 +386,11 @@ def process_tick_data(shared_data,
     max_break_time = shared_data['最大开板回封时间']
     pre_market_holdings = shared_data['盘前持仓']
     order_status = shared_data['委托状态']
+    watch_list = shared_data.get('观察名单', {})
+    watchlist_metadata = shared_data.get('观察名单元数据')
+    break_episode_state = shared_data.get('炸板episode状态')
+    review_counters = shared_data.get('复盘统计计数器')
+    decision_tags = shared_data.get('决策原因标签')
 
     while True:
         try:
@@ -229,6 +413,7 @@ def process_tick_data(shared_data,
                 # 缓存单只股票的常用信息，减少重复查找
                 stock_info = stock_info_dict[stock_code]
                 stock_status = stock_status_signals[stock_code]
+                stock_name = stock_info["股票名称"]
                 limit_up_price = stock_info["涨停价"]
                 down_limit_price = stock_info["跌停价"]
                 is_near_limit_up = False
@@ -241,6 +426,15 @@ def process_tick_data(shared_data,
                     logger.info(f'跳过集合竞价，{data}')
                     continue
                 else:
+                    _check_watchlist_release(shared_data,
+                                             stock_code,
+                                             data,
+                                             stock_info,
+                                             watch_list,
+                                             watchlist_metadata,
+                                             decision_tags,
+                                             review_counters)
+
                     # 性能优化：使用缓存的价格比较函数和预先缓存的价格
                     # 涨停状态, 真实封板, 买一价为涨停价
                     is_limit_up = _check_same_price(data['bidPrice'][0],
@@ -301,6 +495,28 @@ def process_tick_data(shared_data,
                                 # 追加涨停时间
                                 limit_up_pool[stock_code] += f'{data["time"]},'
 
+                            if break_episode_state is not None:
+                                previous_episode = dict(
+                                    break_episode_state.get(stock_code, {}))
+                                previous_episode.update({
+                                    'stock_name': stock_name,
+                                    'first_limit_time': previous_episode.get('first_limit_time', data['time']),
+                                    'last_limit_time': data['time'],
+                                    'is_active': False,
+                                })
+                                break_episode_state[stock_code] = previous_episode
+
+                            _increment_review_counter(review_counters,
+                                                      'limit_up_count')
+                            record_strategy_event(
+                                shared_data,
+                                event_type='limit_up',
+                                stock_code=stock_code,
+                                stock_name=stock_name,
+                                reason='首次涨停',
+                                snapshot=data,
+                                extra={'limit_price': limit_up_price})
+
                             logger.info(
                                 f'{stock_code} {stock_info["股票名称"]} 涨停，当前价格：{data["bidPrice"][0]}，涨停价：{limit_up_price}'
                             )
@@ -329,6 +545,16 @@ def process_tick_data(shared_data,
                                     max_break_time[stock_code]):
                                 max_break_time[
                                     stock_code] = limit_up_break_duration
+
+                            episode = _finish_break_episode(shared_data,
+                                                            stock_code,
+                                                            stock_info,
+                                                            data,
+                                                            break_episode_state,
+                                                            review_counters)
+                            if episode is not None:
+                                episode['last_limit_time'] = data['time']
+                                break_episode_state[stock_code] = episode
 
                             logger.info(
                                 f'{stock_code} {stock_info["股票名称"]} 回封涨停，开板时长:{int(limit_up_break_duration)}秒, 当前价格：{data["bidPrice"][0]}，涨停价：{limit_up_price}'
@@ -359,6 +585,13 @@ def process_tick_data(shared_data,
                             else:
                                 break_count[stock_code] = 1
 
+                            _start_break_episode(shared_data,
+                                                 stock_code,
+                                                 stock_info,
+                                                 data,
+                                                 break_episode_state,
+                                                 review_counters)
+
                             logger.info(
                                 f'{stock_code} {stock_info["股票名称"]} 开板，当前价格：{data["bidPrice"][0]}，涨停价：{limit_up_price}'
                             )
@@ -381,6 +614,17 @@ def process_tick_data(shared_data,
                             if limit_up_break_duration <= 60:
                                 up_limit_break_count -= 1  # 如果开板时间小于60秒，暂不记录开板次数
 
+                            episode = dict(
+                                break_episode_state.get(stock_code, {})) if break_episode_state is not None else {}
+                            episode['episode_duration'] = limit_up_break_duration
+                            limit_drawdown = max(
+                                0.0,
+                                (limit_up_price - data['lastPrice']) / limit_up_price
+                            ) if limit_up_price else 0.0
+                            episode['latest_drawdown_from_limit'] = limit_drawdown
+                            if break_episode_state is not None:
+                                break_episode_state[stock_code] = episode
+
                             # 开板次数过多，加入黑名单
                             if up_limit_break_count >= MAX_UP_LIMIT_BREAK_COUNT:
                                 # 加入黑名单
@@ -388,6 +632,17 @@ def process_tick_data(shared_data,
                                 if stock_code not in blacklist:
                                     blacklist[stock_code] = msg
                                     logger.warning(msg)
+                                    record_strategy_event(
+                                        shared_data,
+                                        event_type='blacklist_enter',
+                                        stock_code=stock_code,
+                                        stock_name=stock_name,
+                                        reason=msg,
+                                        snapshot=data,
+                                        extra={
+                                            'blacklist_reason': 'break_count',
+                                            'break_count': up_limit_break_count,
+                                        })
                                     send_email(
                                         f'【黑名单】{stock_code} {stock_info["股票名称"]}',
                                         msg)
@@ -400,6 +655,17 @@ def process_tick_data(shared_data,
                                 if stock_code not in blacklist:
                                     blacklist[stock_code] = msg
                                     logger.warning(msg)
+                                    record_strategy_event(
+                                        shared_data,
+                                        event_type='blacklist_enter',
+                                        stock_code=stock_code,
+                                        stock_name=stock_name,
+                                        reason=msg,
+                                        snapshot=data,
+                                        extra={
+                                            'blacklist_reason': 'break_duration',
+                                            'max_break_duration': int(max_break_time[stock_code]),
+                                        })
                                     send_email(
                                         f'【黑名单】{stock_code} {stock_info["股票名称"]}',
                                         msg)
@@ -412,6 +678,18 @@ def process_tick_data(shared_data,
                                 if stock_code not in blacklist:
                                     blacklist[stock_code] = msg
                                     logger.warning(msg)
+                                    record_strategy_event(
+                                        shared_data,
+                                        event_type='blacklist_enter',
+                                        stock_code=stock_code,
+                                        stock_name=stock_name,
+                                        reason=msg,
+                                        snapshot=data,
+                                        extra={
+                                            'blacklist_reason': 'break_drawdown',
+                                            'drawdown_from_limit': round(limit_drawdown, 4),
+                                            'break_duration': int(limit_up_break_duration),
+                                        })
                                     send_email(
                                         f'【黑名单】{stock_code} {stock_info["股票名称"]}',
                                         msg)
@@ -501,6 +779,27 @@ def process_tick_data(shared_data,
                         with stock_status['下单状态'].get_lock():
                             stock_status[
                                 '下单状态'].value = StockOrderStatusInt.ORDERED_BUY
+                        _update_decision_tag(decision_tags,
+                                             stock_code,
+                                             'buy_decision',
+                                             order.get('操作原因', ''),
+                                             extra={
+                                                 'buy_type': order.get('买入类型', '排板' if is_limit_up else '扫板')
+                                             })
+                        _increment_review_counter(review_counters,
+                                                  'buy_decision_count')
+                        record_strategy_event(
+                            shared_data,
+                            event_type='buy_decision',
+                            stock_code=stock_code,
+                            stock_name=stock_name,
+                            reason=order.get('操作原因', ''),
+                            snapshot=data,
+                            extra={
+                                'buy_type': order.get('买入类型', '排板' if is_limit_up else '扫板'),
+                                'is_limit_up': is_limit_up,
+                                'is_near_limit_up': is_near_limit_up,
+                            })
 
                     elif should_cancel(shared_data,
                                        data,
@@ -527,6 +826,20 @@ def process_tick_data(shared_data,
                             '快照': data  # 附带当前Tick快照
                         })
                         order_queue.put(order)
+                        _update_decision_tag(decision_tags,
+                                             stock_code,
+                                             'cancel_decision',
+                                             order.get('操作原因', ''))
+                        _increment_review_counter(review_counters,
+                                                  'cancel_decision_count')
+                        record_strategy_event(
+                            shared_data,
+                            event_type='cancel_decision',
+                            stock_code=stock_code,
+                            stock_name=stock_name,
+                            reason=order.get('操作原因', ''),
+                            snapshot=data,
+                            extra={'is_limit_up': is_limit_up})
 
                     elif should_sell(shared_data=shared_data,
                                      stock_code=stock_code,
@@ -542,6 +855,23 @@ def process_tick_data(shared_data,
                                      order=order):
                         # ----------------------------------- 卖出 ------------------------------------ #
                         order_queue.put(order)
+                        _update_decision_tag(decision_tags,
+                                             stock_code,
+                                             'sell_decision',
+                                             order.get('操作原因', ''))
+                        _increment_review_counter(review_counters,
+                                                  'sell_decision_count')
+                        record_strategy_event(
+                            shared_data,
+                            event_type='sell_decision',
+                            stock_code=stock_code,
+                            stock_name=stock_name,
+                            reason=order.get('操作原因', ''),
+                            snapshot=data,
+                            extra={
+                                'order_remark': order.get('委托备注', ''),
+                                'target_remaining_volume': order.get('剩余仓位'),
+                            })
 
                 # ----------------------------- 记录前买一价格及扫板所需资金等 ----------------------------- #
                 with stock_status['前一价格'].get_lock():
