@@ -24,7 +24,11 @@ if DEPS_DIR not in sys.path:
 from config import (
     VERSION, DEBUG_MODE, IS_LIVE_TRADING, ENABLE_SHADOW_SIGNAL,
     ENABLE_PRE_MARKET_LLM_ANALYSIS, IP, PORT, STOP_TIME, TODAY,
-    STRATEGY_NAME, MONITOR_LOG_PATH,
+    STRATEGY_NAME, MONITOR_LOG_PATH, SECTOR_DATA_SOURCE,
+    AUTO_REFRESH_THS_SECTOR_MAPPING, IWENCAI_SECTOR_URL,
+    IWENCAI_DOWNLOAD_DIR, IWENCAI_BROWSER_USER_DATA_DIR,
+    IWENCAI_HEADLESS,
+    IWENCAI_PAGE_SIZE, IWENCAI_MAX_PAGES,
 )
 from infra.common_enums import *
 from infra.utils import send_email, init_logger
@@ -53,6 +57,37 @@ def get_callback_heartbeat_monitor(timeout: float = 30):
         _callback_heartbeat_monitor = CallbackHeartbeatMonitor(
             name="xtdata_whole_quote_callback", timeout=timeout)
     return _callback_heartbeat_monitor
+
+
+def refresh_sector_mapping_if_needed():
+    """按配置刷新 THS 问财行业/概念映射。"""
+    if SECTOR_DATA_SOURCE != 'THS' or not AUTO_REFRESH_THS_SECTOR_MAPPING:
+        return
+
+    try:
+        from scraper.ths_sector_parser import (THSSectorParser,
+                                               refresh_ths_sector_mappings)
+
+        logger.info('[板块映射] 开始刷新 THS 问财行业/概念映射...')
+        refreshed = refresh_ths_sector_mappings(
+            url=IWENCAI_SECTOR_URL,
+            download_dir=IWENCAI_DOWNLOAD_DIR,
+            user_data_dir=IWENCAI_BROWSER_USER_DATA_DIR,
+            headless=IWENCAI_HEADLESS,
+            fallback_to_latest=True,
+            per_page=IWENCAI_PAGE_SIZE,
+            max_pages=IWENCAI_MAX_PAGES)
+        if refreshed:
+            logger.info('[板块映射] THS 问财行业/概念映射刷新完成')
+        elif THSSectorParser.output_files_exist():
+            logger.warning('[板块映射] 自动刷新失败，继续使用现有 THS 映射文件')
+        else:
+            raise RuntimeError('THS 问财映射刷新失败，且本地无可用映射文件')
+    except Exception as exc:
+        logger.exception(f'[板块映射] 刷新 THS 问财映射失败: {exc}')
+        send_email('【关键错误】THS问财板块映射刷新失败',
+                   f'THS 问财板块映射刷新失败: {exc}\n{traceback.format_exc()}')
+        raise
 
 
 def main():
@@ -103,6 +138,8 @@ def main():
 
     # 初始化 TaskManager
     task_manager = get_task_manager(stop_time=STOP_TIME)
+
+    refresh_sector_mapping_if_needed()
 
     shared_data = init_shared_data(stock_pool,
                                    stock_info_dict,

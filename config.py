@@ -18,6 +18,18 @@ ENABLE_SHADOW_SIGNAL = False  # 影子信号模式：不真实下单，而是使
 
 # 板块数据源配置: 'THS' (同花顺) 或 'EM' (东方财富)，默认使用THS
 SECTOR_DATA_SOURCE = 'THS'
+AUTO_REFRESH_THS_SECTOR_MAPPING = True
+IWENCAI_SECTOR_URL = (
+    'https://www.iwencai.com/unifiedwap/result?'
+    'w=%E8%82%A1%E7%A5%A8%E6%89%80%E5%B1%9E%E8%A1%8C%E4%B8%9A%E5%92%8C%E6%A6%82%E5%BF%B5'
+    '&querytype=stock&sign=<redacted>'
+)
+IWENCAI_DOWNLOAD_DIR = os.path.join('output', 'iwencai')
+IWENCAI_BROWSER_USER_DATA_DIR = os.path.join('output', 'playwright', 'iwencai')
+IWENCAI_BROWSER_CHANNEL = 'msedge'
+IWENCAI_HEADLESS = False
+IWENCAI_PAGE_SIZE = 100
+IWENCAI_MAX_PAGES = None
 
 STRATEGY_NAME = f'FirstLimitUp_{VERSION}_Debug' if DEBUG_MODE else f'FirstLimitUp_{VERSION}'  # 不要出现中文，以免FTP目录出现乱码
 SHOULD_DOWNLOAD_KLINE = True
@@ -33,7 +45,7 @@ CLIENT_CONFIGS = {
     'GJ_SIM': {
         'client_path': '<redacted-qmt-path>',
         'stock_account': '<redacted-account>',
-        'is_live_trading': False,
+        'is_live_trading': True,
     },
 }
 

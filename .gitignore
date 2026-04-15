@@ -49,3 +49,4 @@ msedgedriver.exe
 # Jupyter
 .ipynb_checkpoints/
 .claude/settings.local.json
+.claude/settings.json
