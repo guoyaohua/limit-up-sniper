@@ -18,7 +18,7 @@ ENABLE_SHADOW_SIGNAL = False  # 影子信号模式：不真实下单，而是使
 
 # 板块数据源配置: 'THS' (同花顺) 或 'EM' (东方财富)，默认使用THS
 SECTOR_DATA_SOURCE = 'THS'
-AUTO_REFRESH_THS_SECTOR_MAPPING = True
+AUTO_REFRESH_THS_SECTOR_MAPPING = False  # 设为 True 则策略启动时自动拉取问财板块映射（频繁运行可能被封）
 IWENCAI_SECTOR_URL = (
     'https://www.iwencai.com/unifiedwap/result?'
     'w=%E8%82%A1%E7%A5%A8%E6%89%80%E5%B1%9E%E8%A1%8C%E4%B8%9A%E5%92%8C%E6%A6%82%E5%BF%B5'
