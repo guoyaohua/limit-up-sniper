@@ -11,7 +11,9 @@ from datetime import datetime
 from loguru import logger
 
 # 日志根目录
-LOG_ROOT = r"G:\Logs\ai_hotspot_trader"
+LOG_ROOT = os.getenv(
+    'AI_HOTSPOT_LOG_DIR', os.path.join('logs', 'ai_hotspot_trader')
+)
 
 # 当前客户端标识（运行时通过 setup_logger 设置）
 _current_client_key = None

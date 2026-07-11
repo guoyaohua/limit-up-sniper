@@ -4,7 +4,7 @@
 
 ## ai_hotspot_trader/
 
-来源：旧项目的 `ai_hotspot_trader` 公共模块；历史路径已脱敏。
+来源：旧项目的 `ai_hotspot_trader` 公共模块；已作为 vendored 依赖迁入本目录。
 
 - `llm_client/` - LLM 客户端（Azure OpenAI / DashScope / Copilot Vision）
 - `ths_scraper/` - 同花顺热股榜抓取

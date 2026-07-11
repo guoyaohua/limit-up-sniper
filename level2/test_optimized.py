@@ -48,8 +48,7 @@ class TestDequeBuffer(unittest.TestCase):
         """测试基本的put和get操作"""
         packet = DataPacket(
             stock_code="600000.SH",
-            data={"price": 10.0, "volume": 1000},
-            data_type="quote"
+            data={"price": 10.0, "volume": 1000}
         )
         
         # 写入
@@ -72,8 +71,7 @@ class TestDequeBuffer(unittest.TestCase):
         packets = [
             DataPacket(
                 stock_code=f"60000{i}.SH",
-                data={"price": 10.0 + i, "volume": 1000 + i},
-                data_type="quote"
+                data={"price": 10.0 + i, "volume": 1000 + i}
             )
             for i in range(10)
         ]
@@ -92,8 +90,7 @@ class TestDequeBuffer(unittest.TestCase):
         for i in range(1100):  # 超过maxlen(1000)
             packet = DataPacket(
                 stock_code=f"test{i}",
-                data={},
-                data_type="test"
+                data={}
             )
             self.buffer.put(packet)
         
@@ -225,8 +222,7 @@ def benchmark_thread_scalability():
                     'bidPrice': [10.0 + i * 0.01],
                     'askPrice': [10.1 + i * 0.01],
                     'lastPrice': 10.05 + i * 0.01
-                },
-                data_type='quote'
+                }
             )
             buffer.put(packet)
         
@@ -279,8 +275,7 @@ def benchmark_buffer_throughput():
     for i in range(num_operations):
         packet = DataPacket(
             stock_code=f"test{i}",
-            data={"value": i},
-            data_type="test"
+            data={"value": i}
         )
         buffer.put(packet)
     
@@ -318,8 +313,7 @@ def test_memory_usage():
             'askPrice': [10.1] * 10,
             'bidVol': [1000] * 10,
             'askVol': [1000] * 10
-        },
-        data_type='quote'
+        }
     )
     
     packet_size = sys.getsizeof(packet)

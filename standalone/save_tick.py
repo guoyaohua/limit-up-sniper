@@ -20,7 +20,7 @@ from infra.utils import send_email, init_logger
 
 # ================================== 全局配置 ================================== #
 # 数据存储根目录 - 可配置
-DATA_ROOT_DIR = r'F:\AStockTick'
+DATA_ROOT_DIR = os.getenv('TICK_DATA_DIR', os.path.join('output', 'tick_data'))
 TODAY = datetime.now().strftime('%Y%m%d')
 SAVE_FOLDER = os.path.join(DATA_ROOT_DIR, TODAY)
 RAW_TICK_FILE = os.path.join(SAVE_FOLDER, f'raw_tick_data_{TODAY}.jsonl')
@@ -39,7 +39,10 @@ os.makedirs(SAVE_FOLDER, exist_ok=True)
 # 初始化日志记录器
 init_logger(
     os.path.basename(__file__)[:-3],  # 使用脚本文件名作为日志名称
-    log_dir=rf'G:\Logs\{VERSION}_{TODAY}',  # 日志文件存放目录
+    log_dir=os.path.join(
+        os.getenv('LIMIT_UP_LOG_DIR', os.path.join('logs', 'monitor')),
+        f'{VERSION}_{TODAY}',
+    ),
     verbose=True)  # 是否在控制台打印日志
 
 

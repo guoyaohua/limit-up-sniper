@@ -103,6 +103,20 @@ def main():
     # 初始化日志
     init_logger(STRATEGY_NAME, MONITOR_LOG_PATH)
 
+    missing_client_config = [
+        name for name, value in {
+            'CLIENT_PATH': CLIENT_PATH,
+            'STOCK_ACCOUNT': STOCK_ACCOUNT,
+        }.items() if not value
+    ]
+    if missing_client_config:
+        env_prefix = 'CICC' if CLIENT_NAME == 'CICC_LIVE' else 'GJ_SIM'
+        missing = ', '.join(missing_client_config)
+        raise RuntimeError(
+            f'交易客户端配置缺失：{missing}。请设置环境变量 '
+            f'{env_prefix}_QMT_CLIENT_PATH 和 {env_prefix}_STOCK_ACCOUNT。'
+        )
+
     PRE_TRADE_DATE = get_pretrade_date(TODAY)
     try:
         from xtquant import xtdata
@@ -111,8 +125,12 @@ def main():
         mode_label = '实盘' if IS_LIVE_TRADING else '模拟'
         print('=' * 50)
         print(f'  交易客户端 : {CLIENT_NAME}')
-        print(f'  客户端路径 : {CLIENT_PATH}')
-        print(f'  资金账号   : {STOCK_ACCOUNT}')
+        print('  客户端路径 : 已配置（已隐藏）')
+        masked_account = (
+            f'{STOCK_ACCOUNT[:2]}***{STOCK_ACCOUNT[-2:]}'
+            if len(STOCK_ACCOUNT) >= 5 else '***'
+        )
+        print(f'  资金账号   : {masked_account}')
         print(f'  交易模式   : {mode_label}')
         print(f'  策略版本   : {VERSION}')
         print('=' * 50)
@@ -188,7 +206,7 @@ def main():
                      heartbeat_timeout=60))
 
     # 注册交易模块
-    if not DEBUG_MODE:
+    if IS_LIVE_TRADING:
         task_manager.register_task(
             TaskInfo(
                 name='交易模块',

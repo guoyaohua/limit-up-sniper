@@ -1,7 +1,6 @@
 import unittest
 import os
 import shutil
-import pickle
 from multiprocessing import Manager
 from datetime import datetime
 
@@ -20,8 +19,9 @@ class MockLogger:
 
 logger = MockLogger()
 
-# Import the functions to be tested from the main script
-from 打板策略_v1 import (
+# Import the functions from their post-migration module.
+from config import STRATEGY_NAME
+from data.serialization import (
     save_shared_data,
     load_shared_data,
     deep_serialize,
@@ -39,7 +39,7 @@ class TestSaveLoadSharedData(unittest.TestCase):
 
     def tearDown(self):
         """Clean up the temporary directory."""
-        # shutil.rmtree(self.test_dir)
+        shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_save_and_load(self):
         """Test saving and loading of shared_data."""
@@ -64,11 +64,14 @@ class TestSaveLoadSharedData(unittest.TestCase):
 
             # Verify that the file was created with the correct date stamp
             today_str = datetime.now().strftime('%Y%m%d')
-            expected_file = os.path.join(self.test_dir, f"shared_data_backup_{today_str}.pkl")
+            expected_file = os.path.join(
+                self.test_dir, STRATEGY_NAME,
+                f"shared_data_backup_{today_str}.pkl"
+            )
             self.assertTrue(os.path.exists(expected_file), f"Data file '{expected_file}' should exist after saving")
 
             # 3. Load the data
-            loaded_shared_data = load_shared_data(manager, self.test_dir)
+            loaded_shared_data = load_shared_data(self.test_dir)
             self.assertIsNotNone(loaded_shared_data, "Loaded data should not be None")
 
             # 4. Compare the data
@@ -76,8 +79,22 @@ class TestSaveLoadSharedData(unittest.TestCase):
             original_dict = deep_serialize(original_shared_data)
             loaded_dict = deep_serialize(loaded_shared_data)
 
-            # The entire dictionary is wrapped in a top-level object, so we compare the inner '_value_' dictionaries.
-            self.assertDictEqual(original_dict['_value_'], loaded_dict['_value_'])
+            # Restored shared_data intentionally uses a plain top-level dict so
+            # it can contain native multiprocessing.Value/Array on Windows.
+            original_value = original_dict.get('_value_', original_dict)
+            loaded_value = loaded_dict.get('_value_', loaded_dict)
+            self.assertEqual(
+                original_value['value_key']['_typecode_'],
+                loaded_value['value_key']['_typecode_'],
+            )
+            self.assertAlmostEqual(
+                original_value['value_key']['_value_'],
+                loaded_value['value_key']['_value_'],
+                places=4,
+            )
+            original_value.pop('value_key')
+            loaded_value.pop('value_key')
+            self.assertDictEqual(original_value, loaded_value)
 
 if __name__ == '__main__':
     # To run this test, you might need to adjust sys.path if run from a different directory

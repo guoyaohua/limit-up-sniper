@@ -1,8 +1,16 @@
+<p align="center">
+  <img src="assets/logo.svg" width="132" alt="Limit-Up Sniper logo">
+</p>
+
 # Limit-Up Sniper
 
 **A股首板涨停打板策略自动化交易系统 v1.0**
 
 > 一套面向中国 A 股市场的全自动化涨停板交易系统，融合量化选股、实时行情处理、多因子动态决策、LLM 板块预测、动态追踪止损等技术，实现从盘前分析到盘后复盘的全流程自动化。
+
+> [!WARNING]
+> 默认执行模式是 `simulation`。切换到 `live` 会发送真实委托；任何历史表现都
+> 不代表未来收益，本项目不构成投资建议。
 
 ---
 
@@ -21,6 +29,30 @@
 - **盘后智能复盘** — 自动计算每个过滤条件的精确率/召回率/F1，分析错过的机会
 - **影子信号模式** — 实盘运行同时并行虚拟回测，对比策略变体表现
 - **Level2 数据支持** — 共享内存环形缓冲区 + 逐笔数据处理，微秒级延迟
+
+---
+
+## 策略架构
+
+```mermaid
+flowchart LR
+    A[XTQuant / 东方财富 / 同花顺] --> B[股票池与涨停基因]
+    B --> C[实时 Tick 状态机]
+    A --> D[板块与市场情绪]
+    E[盘前 LLM<br/>仅输出板块权重] --> D
+    C --> F{风控过滤}
+    D --> F
+    F -->|通过| G[排板 / 扫板信号]
+    F -->|拒绝| H[黑名单 / 观察名单]
+    G --> I[模拟或实盘执行器]
+    I --> J[分档止盈 / 追踪止损]
+    C --> K[结构化事件日志]
+    I --> K
+    K --> L[盘后复盘与影子验证]
+```
+
+LLM 不直接决定买卖，只在经过结构校验后对候选板块的封单门槛提供有限折扣；
+最终信号仍须同时通过股性、市场情绪、板块联动、资金流、换手率、封单与集中度检查。
 
 ---
 
@@ -107,7 +139,7 @@ limit-up-sniper/
 
 ### 环境要求
 
-- Python 3.8+
+- Python 3.10+（CI 使用 3.11）
 - Windows 操作系统（XTQuant/QMT 仅支持 Windows）
 - QMT 量化交易客户端已安装并启动
 - XTQuant 数据服务在线
@@ -115,26 +147,30 @@ limit-up-sniper/
 ### 安装依赖
 
 ```bash
-pip install pandas numpy akshare schedule tqdm loguru beautifulsoup4 msgpack
+python -m pip install -r requirements.txt
 ```
 
-XTQuant SDK 需要从 QMT 客户端获取，不在 PyPI 上。
+XTQuant SDK 需要从 QMT 客户端获取，不在 PyPI 上；缺少 SDK 时仍可运行不依赖
+行情连接的离线单元测试。
 
 ### 配置
 
-编辑 `config.py`：
+复制 `.env.example` 作为本机配置参考，并在系统或进程环境中设置所需变量。
+项目不会从 `.env` 自动加载配置，也不要把真实账号或密钥写进代码、文档或提交。
+PowerShell 示例：
 
-```python
-# 交易账户
-QMT_CLIENT_PATH = '<redacted-qmt-path>'
-STOCK_ACCOUNT = '<redacted-account>'
-
-# 模式选择
-DEBUG_MODE = True   # True=模拟交易, False=实盘交易
-
-# 邮件告警
-# 设置环境变量 QQ_MAIL_TOKEN
+```powershell
+$env:LIMIT_UP_CLIENT_NAME = 'GJ_SIM'
+$env:LIMIT_UP_EXECUTION_MODE = 'simulation'
+$env:GJ_SIM_QMT_CLIENT_PATH = '<redacted-qmt-path>'
+$env:GJ_SIM_STOCK_ACCOUNT = '<redacted-account>'
 ```
+
+邮件与可选 FTPS 报告发布分别使用 `SMTP_*` 和 `REPORT_FTP_*` 环境变量；
+完整清单见 [`.env.example`](.env.example) 与 [配置手册](docs/configuration.md)。
+
+真实委托需要显式设置 `LIMIT_UP_EXECUTION_MODE=live`，启动时仍需人工输入
+`yes` 二次确认。日志只显示遮罩后的账号，客户端路径不回显。
 
 ### 运行
 
@@ -224,6 +260,7 @@ scripts\run_strategy.bat
 | [数据采集](docs/scraper.md) | 东方财富/同花顺数据抓取、反爬策略 |
 | [Level2 行情](docs/level2.md) | Level2 逐笔数据处理架构与实现 |
 | [基础设施](docs/infrastructure.md) | 进程管理、枚举定义、日志与邮件 |
+| [迁移策略复盘](docs/strategy-review-2025-12-23_2026-01-12.md) | 旧项目 12 日报告聚合、保护清单与改进证据 |
 
 **推荐阅读顺序**：架构总览 → 交易流程 → 核心策略 → 配置参数
 
@@ -264,6 +301,9 @@ scripts\run_strategy.bat
 ## 测试
 
 ```bash
+# 全部离线测试（外部集成测试默认跳过）
+python -m pytest -q
+
 # 涨停基因计算一致性测试
 python -m pytest test/test_calculate_stock_gene_consistency.py
 
@@ -276,6 +316,9 @@ python -m pytest test/test_save_load.py
 # 板块监控测试
 python -m pytest test/test_sector_monitor.py
 ```
+
+默认套件只收集可离线运行的回归测试。需要 QMT、网络、浏览器或本地行情文件
+的脚本应单独指定路径运行，并显式设置 `RUN_INTEGRATION_TESTS=true`。
 
 ---
 
@@ -294,4 +337,11 @@ python -m pytest test/test_sector_monitor.py
 
 ## 风险提示
 
-本系统仅供量化交易研究与学习使用。股票投资有风险，自动化交易可能导致快速亏损。请在充分了解风险的前提下使用，并始终以模拟交易 (`DEBUG_MODE = True`) 进行充分测试后再考虑实盘运行。
+本系统仅供量化交易研究与学习使用。股票投资有风险，自动化交易可能导致快速亏损。请在充分了解风险的前提下使用，并始终以 `LIMIT_UP_EXECUTION_MODE=simulation` 进行充分测试后再考虑实盘运行。
+
+## 安全与许可
+
+账号、路径、API key、SMTP/FTP 凭据和抓取会话令牌全部通过环境变量传入。
+提交前运行 `python scripts/scan_secrets.py`，并用 gitleaks 扫描完整历史；发现泄露后应先轮换
+凭据，再清理历史。安全报告方式见 [SECURITY.md](SECURITY.md)。项目采用
+[MIT License](LICENSE)。

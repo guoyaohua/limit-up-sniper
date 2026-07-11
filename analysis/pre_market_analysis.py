@@ -18,6 +18,7 @@
 
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -88,10 +89,8 @@ def _get_yesterday_limit_up_stocks() -> str:
     """从涨停基因CSV中获取昨日涨停列表"""
     try:
         import pandas as pd
-        from datetime import date, timedelta
-
         # 尝试读取最近的涨停基因文件
-        gene_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'output', '涨停基因')
+        gene_dir = os.path.join(ROOT_DIR, 'output', '涨停基因')
         if not os.path.exists(gene_dir):
             return '数据不可用'
 
@@ -100,7 +99,10 @@ def _get_yesterday_limit_up_stocks() -> str:
         if not files:
             return '数据不可用'
 
-        df = pd.read_csv(os.path.join(gene_dir, files[0]))
+        df = pd.read_csv(
+            os.path.join(gene_dir, files[0]),
+            dtype={'股票代码': str},
+        )
         limit_up = df[df['涨停'] == True]
         if limit_up.empty:
             return '昨日无涨停股票'
@@ -118,36 +120,47 @@ def _get_yesterday_limit_up_stocks() -> str:
 
 def _call_llm(prompt: str) -> str:
     """调用 LLM 获取板块预判"""
+    started_at = time.monotonic()
     try:
-        from llm_client import chat_with_dashscope
+        from llm_client import DashScopeOpenAIClient
         from llm_client.config import DASHSCOPE_TEXT_MODELS
 
         # 选择第一个可用的文本模型
         model = DASHSCOPE_TEXT_MODELS[0] if DASHSCOPE_TEXT_MODELS else 'qwen3.5-plus'
 
-        response = chat_with_dashscope(
-            prompt=prompt,
+        client = DashScopeOpenAIClient(
             model=model,
+            timeout=LLM_TIMEOUT,
+            max_retries=0,
+        )
+        return client.chat(
+            prompt,
             stream=False,
             max_tokens=2048,
             temperature=0.1,
         )
-        return response
     except Exception as e:
         logger.error(f'LLM 调用失败: {e}')
         # 退回到 Azure
         try:
-            from llm_client import chat_with_azure
+            remaining_timeout = LLM_TIMEOUT - (time.monotonic() - started_at)
+            if remaining_timeout <= 0:
+                logger.error('LLM 调用已耗尽总超时预算，跳过 Azure 备用模型')
+                return ''
+            from llm_client import AzureOpenAIClient
             from llm_client.config import AZURE_TEXT_MODELS
             model = AZURE_TEXT_MODELS[0] if AZURE_TEXT_MODELS else 'DeepSeek-V3.2-Speciale'
-            response = chat_with_azure(
-                prompt=prompt,
+            client = AzureOpenAIClient(
                 model=model,
+                timeout=remaining_timeout,
+                max_retries=0,
+            )
+            return client.chat(
+                prompt,
                 stream=False,
                 max_tokens=2048,
                 temperature=0.1,
             )
-            return response
         except Exception as e2:
             logger.error(f'Azure LLM 也调用失败: {e2}')
             return ''
@@ -165,6 +178,8 @@ def _parse_llm_response(response: str) -> dict:
             json_str = response.strip()
 
         result = json.loads(json_str)
+        if not isinstance(result, dict):
+            raise ValueError('LLM 响应顶层必须是 JSON 对象')
 
         # 验证结构
         if 'priority_sectors' not in result:
@@ -177,14 +192,62 @@ def _parse_llm_response(response: str) -> dict:
             result['key_stocks'] = []
 
         return result
-    except (json.JSONDecodeError, IndexError, KeyError) as e:
-        logger.error(f'解析 LLM 响应失败: {e}, 响应内容: {response[:200]}...')
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError, ValueError) as e:
+        logger.error(f'解析 LLM 响应失败: {e}, 响应内容: {str(response)[:200]}...')
         return {
             'market_outlook': '未知',
             'priority_sectors': [],
             'avoid_sectors': [],
             'key_stocks': [],
         }
+
+
+def _normalise_llm_result(parsed: dict) -> dict:
+    """Validate untrusted model output before it can affect the strategy."""
+    result = {
+        'priority_sectors': {},
+        'avoid_sectors': [],
+        'market_outlook': '未知',
+        'key_stocks': [],
+    }
+    if not isinstance(parsed, dict):
+        return result
+
+    outlook = parsed.get('market_outlook')
+    if isinstance(outlook, str) and outlook.strip():
+        result['market_outlook'] = outlook.strip()[:20]
+
+    priority_items = parsed.get('priority_sectors', [])
+    if isinstance(priority_items, list):
+        for item in priority_items[:5]:
+            if not isinstance(item, dict):
+                continue
+            sector = item.get('sector')
+            if not isinstance(sector, str) or not sector.strip():
+                continue
+            try:
+                weight = float(item.get('weight', 0.5))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(weight):
+                continue
+            result['priority_sectors'][sector.strip()] = max(0.0, min(1.0, weight))
+
+    avoid_items = parsed.get('avoid_sectors', [])
+    if isinstance(avoid_items, list):
+        for item in avoid_items[:3]:
+            sector = item.get('sector') if isinstance(item, dict) else item
+            if isinstance(sector, str) and sector.strip():
+                result['avoid_sectors'].append(sector.strip())
+
+    key_stocks = parsed.get('key_stocks', [])
+    if isinstance(key_stocks, list):
+        for stock_code in key_stocks[:5]:
+            code = str(stock_code).strip().split('.')[0]
+            if len(code) == 6 and code.isdigit():
+                result['key_stocks'].append(code)
+
+    return result
 
 
 def run_pre_market_analysis() -> dict:
@@ -235,16 +298,8 @@ def run_pre_market_analysis() -> dict:
         # 5. 解析结果
         parsed = _parse_llm_response(response)
 
-        # 转换为内部格式
-        result['market_outlook'] = parsed.get('market_outlook', '未知')
-        result['key_stocks'] = parsed.get('key_stocks', [])
-        result['avoid_sectors'] = [s['sector'] for s in parsed.get('avoid_sectors', [])]
-
-        for sector_info in parsed.get('priority_sectors', []):
-            sector_name = sector_info.get('sector', '')
-            weight = sector_info.get('weight', 0.5)
-            if sector_name:
-                result['priority_sectors'][sector_name] = max(0.0, min(1.0, weight))
+        # 转换为内部格式，并在影响策略前校验不可信的模型输出
+        result = _normalise_llm_result(parsed)
 
         elapsed = time.time() - start_time
         logger.info(

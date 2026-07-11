@@ -10,16 +10,12 @@ from email.header import Header
 import concurrent.futures
 
 # --- 邮件配置 ---
-# SMTP服务器地址，这里使用QQ邮箱的SMTP服务器
-MAIL_HOST = "smtp.qq.com"
-# 发件人邮箱账户
-MAIL_USER = '<redacted>'
-# 发件人邮箱授权码，从环境变量中获取，增强安全性
-MAIL_PASS = os.getenv("QQ_MAIL_TOKEN")
-# 默认发件人邮箱地址
-SENDER_EMAIL = '<redacted>'
-# 默认收件人邮箱地址
-RECEIVER_EMAIL = '<redacted>'
+# SMTP 端点可使用公开默认值；账户、授权码与收发件地址只从环境变量读取。
+MAIL_HOST = os.getenv("SMTP_HOST", "smtp.qq.com")
+MAIL_USER = os.getenv("SMTP_USERNAME", "")
+MAIL_PASS = os.getenv("SMTP_PASSWORD") or os.getenv("QQ_MAIL_TOKEN")
+SENDER_EMAIL = os.getenv("SMTP_SENDER", MAIL_USER)
+RECEIVER_EMAIL = os.getenv("SMTP_RECIPIENT", "")
 
 
 def init_logger(name, log_dir, verbose=False):

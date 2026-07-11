@@ -1,5 +1,5 @@
 from enum import Enum, auto, IntEnum
-from xtquant import xtconstant
+from infra.xtconstant_compat import xtconstant
 
 
 class PreMarketSellStrategy(Enum):

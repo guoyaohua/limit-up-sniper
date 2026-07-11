@@ -13,7 +13,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-from xtquant import xtconstant
+from infra.xtconstant_compat import xtconstant
 from loguru import logger
 
 from config import (
@@ -1022,7 +1022,8 @@ def should_sell(shared_data,
             # 涨停板上不止盈，避免挂卖单干扰封板
             profit_ratio = (last_price - cost_price) / cost_price if cost_price > 0 else 0
             hold_volume = xt_position.get('持仓数量', can_use_volume)
-            for tier_profit, tier_sell_ratio, tier_desc in reversed(INTRADAY_TAKE_PROFIT_TIERS):
+            pending_tiers = []
+            for tier_profit, tier_sell_ratio, tier_desc in INTRADAY_TAKE_PROFIT_TIERS:
                 if profit_ratio >= tier_profit:
                     tier_key = f'止盈_{int(tier_profit*100)}pct'
                     # 检查该档位是否已触发过（用 stock_status 中的标记）
@@ -1035,36 +1036,47 @@ def should_sell(shared_data,
                         else:
                             already_triggered = bool(tier_triggered)
                     if not already_triggered:
-                        target_sell_volume = hold_volume * tier_sell_ratio
-                        sell_volume = int(target_sell_volume / 100) * 100
-                        if sell_volume <= 0 and target_sell_volume > 0 and can_use_volume >= 100:
-                            sell_volume = 100
-                        sell_volume = min(sell_volume, can_use_volume)
+                        pending_tiers.append((
+                            tier_sell_ratio, tier_desc, tier_triggered
+                        ))
 
-                        # 合规检验
-                        sell_volume = int(min(sell_volume / 100, sum(tick_data['bidVol']))) * 100
-                        if sell_volume > 0 and sell_volume <= can_use_volume:
-                            # 标记已触发
-                            if tier_triggered is not None and hasattr(tier_triggered, 'get_lock'):
-                                with tier_triggered.get_lock():
-                                    tier_triggered.value = 1
-                            msg = f'{stock_code} {stock_name} 触发日内止盈: {tier_desc}, 盈利{profit_ratio:.1%}, 卖出{sell_volume}股'
-                            order.clear()
-                            order.update({
-                                '委托类型': OrderType.SELL,
-                                '股票代码': stock_code,
-                                '报价类型': price_type,
-                                '策略名称': STRATEGY_NAME,
-                                '委托备注': f'止盈-{tier_desc}',
-                                '操作原因': msg,
-                                '剩余仓位': can_use_volume - sell_volume,
-                                '快照': tick_data,
-                                '止盈档位': tier_desc,
-                                '止盈收益率': round(profit_ratio, 4),
-                            })
-                            logger.warning(msg)
-                            return True
-                    break  # 只检查最高匹配档位
+            if pending_tiers:
+                # 股价可能在两个 tick 之间直接跨过多个阈值。一次性补齐所有
+                # 未触发档位，避免倒序检查只标记最高档、永久漏掉低档减仓。
+                pending_ratio = sum(tier[0] for tier in pending_tiers)
+                target_sell_volume = hold_volume * pending_ratio
+                sell_volume = int(target_sell_volume / 100) * 100
+                if sell_volume <= 0 and target_sell_volume > 0 and can_use_volume >= 100:
+                    sell_volume = 100
+                sell_volume = min(sell_volume, can_use_volume)
+
+                # 合规检验
+                sell_volume = int(
+                    min(sell_volume / 100, sum(tick_data['bidVol']))
+                ) * 100
+                if sell_volume > 0 and sell_volume <= can_use_volume:
+                    for _, _, tier_triggered in pending_tiers:
+                        if tier_triggered is not None and hasattr(
+                                tier_triggered, 'get_lock'):
+                            with tier_triggered.get_lock():
+                                tier_triggered.value = 1
+                    tier_desc = '；'.join(tier[1] for tier in pending_tiers)
+                    msg = f'{stock_code} {stock_name} 触发日内止盈: {tier_desc}, 盈利{profit_ratio:.1%}, 卖出{sell_volume}股'
+                    order.clear()
+                    order.update({
+                        '委托类型': OrderType.SELL,
+                        '股票代码': stock_code,
+                        '报价类型': price_type,
+                        '策略名称': STRATEGY_NAME,
+                        '委托备注': f'止盈-{tier_desc}',
+                        '操作原因': msg,
+                        '剩余仓位': can_use_volume - sell_volume,
+                        '快照': tick_data,
+                        '止盈档位': tier_desc,
+                        '止盈收益率': round(profit_ratio, 4),
+                    })
+                    logger.warning(msg)
+                    return True
 
         # v3.0: 静态成本止损已移除，统一由下方追踪止盈止损数组处理
 

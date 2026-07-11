@@ -1,33 +1,36 @@
 # 配置参数手册
 
-本文档详细说明 `config.py` 中的所有可配置参数。
+本文档详细说明 `config.py` 中的所有可配置参数。账号、路径和密钥只通过
+环境变量注入；`.env.example` 仅是变量清单，不得填入真实值后提交。
 
 ## 一、全局开关
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `VERSION` | str | `'v1.0'` | 策略版本号 |
-| `DEBUG_MODE` | bool | `False` | 调试模式（使用模拟交易器） |
-| `ENABLE_SHADOW_SIGNAL` | bool | `False` | 影子信号模式（并行回测） |
-| `IS_LIVE_TRADING` | bool | `not DEBUG_MODE` | 实盘交易开关 |
+| `DEBUG_MODE` | bool | `True` | 兼容旧模块；由执行模式自动派生 |
+| `ENABLE_SHADOW_SIGNAL` | bool | `False` | 由 `LIMIT_UP_ENABLE_SHADOW_SIGNAL` 控制 |
+| `IS_LIVE_TRADING` | bool | `False` | 仅当执行模式为 `live` |
 | `SECTOR_DATA_SOURCE` | str | `'THS'` | 板块数据源：`'THS'`(同花顺) 或 `'EM'`(东方财富) |
 
 ---
 
 ## 二、交易账户配置
 
-### 实盘账户
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `LIMIT_UP_CLIENT_NAME` | `GJ_SIM` | 客户端：`GJ_SIM` 或 `CICC_LIVE` |
+| `LIMIT_UP_EXECUTION_MODE` | `simulation` | `simulation` 使用模拟执行器；`live` 发送真实委托 |
+| `LIMIT_UP_ENABLE_SHADOW_SIGNAL` | `false` | 是否并行运行影子策略 |
+| `GJ_SIM_QMT_CLIENT_PATH` | 空 | 模拟端 `userdata_mini` 路径 |
+| `GJ_SIM_STOCK_ACCOUNT` | 空 | 模拟资金账号 |
+| `CICC_QMT_CLIENT_PATH` | 空 | 实盘端 `userdata_mini` 路径 |
+| `CICC_STOCK_ACCOUNT` | 空 | 实盘资金账号 |
+| `XTQUANT_HOST` / `XTQUANT_PORT` | `127.0.0.1` / `58610` | XTQuant 数据服务 |
+| `LIMIT_UP_LOG_DIR` | `logs/monitor` | 本地日志根目录 |
 
-| 参数 | 说明 |
-|------|------|
-| `QMT_CLIENT_PATH` | QMT 客户端 `userdata_mini` 路径 |
-| `STOCK_ACCOUNT` | 资金账号 |
-| `DATA_SERVER_IP` | 数据服务器 IP |
-| `DATA_SERVER_PORT` | 数据服务器端口 |
-
-### 调试账户
-
-`DEBUG_MODE = True` 时使用的模拟环境配置（路径和账号不同）。
+路径或账号为空时，`main.py` 会在连接 QMT 前立即退出并提示缺少的变量。
+`live` 模式还会在启动时要求人工输入 `yes`。
 
 ---
 
@@ -187,9 +190,13 @@ LLM 优先板块折扣：优先板块内的股票，封单阈值额外 × 0.7。
 
 | 参数 | 说明 |
 |------|------|
-| `MAIL_HOST` | SMTP 服务器 (`smtp.qq.com`) |
-| `MAIL_USER` | 发件人邮箱 |
-| `MAIL_PASS` | 邮箱密码（环境变量 `QQ_MAIL_TOKEN`） |
+| `SMTP_HOST` | SMTP 服务器（默认 `smtp.qq.com`） |
+| `SMTP_USERNAME` | SMTP 登录账号 |
+| `SMTP_PASSWORD` | SMTP 密码或授权码 |
+| `SMTP_SENDER` | 发件地址（默认与登录账号相同） |
+| `SMTP_RECIPIENT` | 收件地址 |
+
+为兼容旧部署，未设置 `SMTP_PASSWORD` 时仍会读取 `QQ_MAIL_TOKEN`。
 
 **触发邮件的场景**：
 - 市场情绪评分变化 ≥ 1.0

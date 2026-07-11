@@ -112,7 +112,9 @@ def safe_log_market_sentiment_summary(shared_data, strategy_name):
     """记录市场情绪汇总的安全包装函数 (带超时与重连)"""
     try:
         # 在包装函数内导入以避免循环导入
-        from market_sentiment_report import log_market_sentiment_summary
+        from standalone.market_sentiment_report import (
+            log_market_sentiment_summary,
+        )
         # 设置 30 秒超时
         run_with_timeout(log_market_sentiment_summary,
                          args=(shared_data, strategy_name),

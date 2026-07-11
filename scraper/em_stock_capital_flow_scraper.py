@@ -110,20 +110,17 @@ class UtTokenGenerator:
     """
     动态生成ut令牌
     """
-    # 已知的ut令牌池
+    # 可选会话令牌通过环境变量注入，逗号分隔；公开仓库不保存抓包值。
     UT_TOKENS = [
-        '<redacted-token>',
-        '<redacted-token>',
-        '<redacted-token>',
-        '<redacted-token>',
-        '<redacted-token>',
+        token.strip() for token in os.getenv('EASTMONEY_UT_TOKENS', '').split(',')
+        if token.strip()
     ]
     
     @staticmethod
     def generate_random_ut() -> str:
         """生成随机的32位十六进制ut令牌"""
         # 方法1：从已知池中随机选择
-        if random.random() < 0.7:  # 70%概率使用已知的
+        if UtTokenGenerator.UT_TOKENS and random.random() < 0.7:
             return random.choice(UtTokenGenerator.UT_TOKENS)
         
         # 方法2：生成类似格式的随机令牌

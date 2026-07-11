@@ -35,6 +35,7 @@ userdata_mini/
 # Environment
 .env
 .env.*
+!.env.example
 venv/
 .venv/
 

@@ -183,9 +183,9 @@ def verify_feather_files(file_paths: List[str]):
 
 if __name__ == "__main__":
     # 配置参数
-    BASE_DIR = r"F:\level2"
-    DATE = "20250324"
-    OUTPUT_DIR = None  # 使用默认输出目录 (F:\level2\merged)
+    BASE_DIR = os.getenv('LEVEL2_DATA_DIR', os.path.join('output', 'level2'))
+    DATE = os.getenv('LEVEL2_DATE', datetime.now().strftime('%Y%m%d'))
+    OUTPUT_DIR = os.getenv('LEVEL2_MERGED_DIR')
     
     # 执行合并
     try:

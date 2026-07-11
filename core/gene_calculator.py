@@ -249,6 +249,37 @@ def calculate_stock_gene(data, N=250):
         raise e
 
 
+STRENGTH_SCORE_WEIGHTS = {
+    '涨停次日收盘溢价超5%比例': 0.25,
+    '首板次日收盘红盘率': 0.25,
+    '首板封板率': 0.25,
+    '涨停次数': 0.10,
+    '首板涨停或炸板次日开盘平均溢价': 0.15,
+}
+
+
+def calculate_strength_scores(result_df: pd.DataFrame) -> pd.DataFrame:
+    """Return positive percentile scores for the stock-strength factors.
+
+    Every factor is directional: a larger raw value must produce a larger
+    percentile and therefore a larger composite score.  Keeping this in a
+    pure helper makes the stock-pool ranking independently testable.
+    """
+    scored = result_df.copy()
+    for factor in STRENGTH_SCORE_WEIGHTS:
+        # pandas percentile rank grows with the raw value only when
+        # ascending=True.  The previous descending rank inverted selection.
+        scored[f'{factor}_得分'] = scored[factor].rank(
+            ascending=True, pct=True
+        ) * 100
+
+    scored['涨停基因打分'] = sum(
+        scored[f'{factor}_得分'] * weight
+        for factor, weight in STRENGTH_SCORE_WEIGHTS.items()
+    )
+    return scored
+
+
 def get_strong_stocks(stock_pool, stock_info_dict, end_date):
     try:
         from xtquant import xtdata
@@ -448,52 +479,9 @@ def get_strong_stocks(stock_pool, stock_info_dict, end_date):
         f'日期：{TODAY}，首版封板率小于0.7的股票数量：{len(stock_list)}, 股票代码：{stock_list}')
 
     # --------------------------------- 计算涨停基因打分 --------------------------------- #
-    '''
-    核心备选池筛选 (人和初选)
-    构建个股"涨停基因"加权评分模型 (Stock Strength Score, SSS)，以下为具体的评分计算流程。
-        •	因子权重: (权重不变)
-            o	连板率 (30%)
-            o	涨停次日开盘溢价超5%比例 (25%)
-            o	涨停次日收盘红盘率 (15%)
-            o	首板封板率 (15%)
-            o	涨停次数 (10%)
-            o	涨停或炸板次日开盘平均溢价 (5%)
-        •	因子标准化与评分计算流程:
-            o	获取原始值： 对"基础股票池"中的每一只股票，计算出上述6个因子的原始数值（如连板率25%，涨停次数10次等）。
-            o	标准化： 将每个因子的原始值在所有股票中进行排序，并转换为 0到100的百分位得分。例如，一只股票的"连板率"在所有股票中排名前10%，则其"连板率"因子得分为90。
-        •	因子得分 = (该股票排名 - 1) / (股票总数 - 1) * 100
-            o	加权求和： 将每只股票的6个因子得分，按照其对应的权重进行加权求和，得到最终的SSS。
-        •	SSS = (连板率得分 * 30%) + (溢价超5%比例得分 * 25%) + ...
-            o	筛选： 对所有股票的SSS进行降序排列，选取排名前1000名的股票，生成"核心备选池"。
-    '''
-    result_df['连板率_得分'] = result_df['连板率'].rank(ascending=False,
-                                                pct=True) * 100
-    result_df['涨停次日收盘溢价超5%比例_得分'] = result_df['涨停次日收盘溢价超5%比例'].rank(
-        ascending=False, pct=True) * 100
-    result_df['首板次日收盘红盘率_得分'] = result_df['首板次日收盘红盘率'].rank(ascending=False,
-                                                            pct=True) * 100
-    result_df['首板封板率_得分'] = result_df['首板封板率'].rank(ascending=False,
-                                                    pct=True) * 100
-    result_df['涨停次数_得分'] = result_df['涨停次数'].rank(ascending=False,
-                                                  pct=True) * 100
-    result_df['涨停或炸板次日开盘平均溢价_得分'] = result_df['涨停或炸板次日开盘平均溢价'].rank(
-        ascending=False, pct=True) * 100
-    result_df['首板涨停或炸板次日开盘平均溢价_得分'] = result_df['首板涨停或炸板次日开盘平均溢价'].rank(
-        ascending=False, pct=True) * 100
-    # # 计算总分
-    # result_df['涨停基因打分'] = (result_df['连板率_得分'] * 0.3 +
-    #                        result_df['涨停次日收盘溢价超5%比例_得分'] * 0.25 +
-    #                        result_df['首板次日收盘红盘率_得分'] * 0.15 +
-    #                        result_df['首板封板率_得分'] * 0.15 +
-    #                        result_df['涨停次数_得分'] * 0.1 +
-    #                        result_df['涨停或炸板次日开盘平均溢价_得分'] * 0.05)
-
-    # 计算总分
-    result_df['涨停基因打分'] = (result_df['涨停次日收盘溢价超5%比例_得分'] * 0.25 +
-                           result_df['首板次日收盘红盘率_得分'] * 0.25 +
-                           result_df['首板封板率_得分'] * 0.25 +
-                           result_df['涨停次数_得分'] * 0.1 +
-                           result_df['首板涨停或炸板次日开盘平均溢价_得分'] * 0.15)
+    # 五项正向因子先转成 0-100 百分位，再按固定权重求和。
+    # 原始值越大，百分位与总分必须越大；最终按总分降序取 Top 1000。
+    result_df = calculate_strength_scores(result_df)
 
     # ------------------------------- 筛选出涨停基因良好的股票 ------------------------------- #
     strong_stock_df = result_df.loc[

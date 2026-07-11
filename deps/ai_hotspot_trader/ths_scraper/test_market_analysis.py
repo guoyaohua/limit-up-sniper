@@ -5,10 +5,13 @@
 import requests
 import json
 import base64
+import os
 
 # 尝试解码 token
-token = '<redacted>'
+token = os.getenv('THS_MARKET_ANALYSIS_TOKEN', '')
 try:
+    if not token:
+        raise ValueError('请先设置 THS_MARKET_ANALYSIS_TOKEN')
     # 添加填充
     padding = '=' * (4 - len(token) % 4) if len(token) % 4 else ''
     decoded = base64.b64decode(token + padding)

@@ -5,7 +5,7 @@ This script directly calls the sync_reports_directory function to test synchroni
 with a REAL FTP server.
 
 *** INSTRUCTIONS ***
-1. Fill in your FTP server details in the CONFIG section below.
+1. Export the REPORT_FTP_* environment variables described below.
 2. Run this script from the project's root directory:
    python test/manual_test_ftp_sync.py
 3. Check your FTP server to see if the 'temp_manual_test_reports' directory
@@ -20,24 +20,16 @@ from pathlib import Path
 sys.path.insert(0,
                 os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from market_sentiment_report import FTPSyncUtility
+from standalone.market_sentiment_report import FTPSyncUtility
 
 # --- CONFIGURATION ---
-# !!! IMPORTANT: Fill in your FTP server details here !!!
-# FTP_CONFIG = {
-#     "host": '<redacted>',  # e.g., "ftp.example.com"
-#     "username": '<redacted>',
-#     "password": '<redacted>',
-#     "remote_dir":
-#     "htdocs/test"  # The directory on the server where files will be uploaded
-# }
-
+# Never put real credentials in this file. Configure the manual test via the
+# environment so it remains safe to commit.
 FTP_CONFIG = {
-    "host": '<redacted>',  # e.g., "ftp.example.com"
-    "username": '<redacted>',
-    "password": '<redacted>',
-    "remote_dir":
-    '<redacted>'  # The directory on the server where files will be uploaded
+    "host": os.getenv("REPORT_FTP_HOST", ""),
+    "username": os.getenv("REPORT_FTP_USERNAME", ""),
+    "password": os.getenv("REPORT_FTP_PASSWORD", ""),
+    "remote_dir": os.getenv("REPORT_FTP_TEST_REMOTE_DIR", ""),
 }
 
 def create_local_test_data(base_dir: Path):
@@ -65,9 +57,10 @@ def main():
     """Main function to run the manual test."""
 
     # Check if config is filled
-    if "YOUR_FTP_HOST" in FTP_CONFIG.values():
+    if not all(FTP_CONFIG.values()):
         print(
-            "!!! ERROR: Please fill in your FTP details in the FTP_CONFIG section of this script."
+            "!!! ERROR: Set REPORT_FTP_HOST, REPORT_FTP_USERNAME, "
+            "REPORT_FTP_PASSWORD, and REPORT_FTP_TEST_REMOTE_DIR."
         )
         return
 

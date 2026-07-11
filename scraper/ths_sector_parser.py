@@ -18,7 +18,7 @@ import requests
 DEFAULT_IWENCAI_SECTOR_URL = (
     'https://www.iwencai.com/unifiedwap/result?'
     'w=%E8%82%A1%E7%A5%A8%E6%89%80%E5%B1%9E%E8%A1%8C%E4%B8%9A%E5%92%8C%E6%A6%82%E5%BF%B5'
-    '&querytype=stock&sign=<redacted>'
+    '&querytype=stock'
 )
 DEFAULT_IWENCAI_DOWNLOAD_DIR = os.path.join('output', 'iwencai')
 DEFAULT_IWENCAI_USER_DATA_DIR = os.path.join('output', 'playwright', 'iwencai')

@@ -270,7 +270,7 @@ def _parallel_restore_manager_proxies(items_to_restore):
     return result
 
 
-def deep_restore(value, depth=0):
+def deep_restore(value, depth=0, manager=None):
     """
     深度递归恢复，将序列化的数据结构转换回原始的
     multiprocessing 对象和 Manager 对象
@@ -279,6 +279,12 @@ def deep_restore(value, depth=0):
     1. 对股票状态信号字典使用批量并行恢复
     2. 对顶层 Manager 代理对象使用并行恢复
     """
+    # 所有 Manager 代理必须由同一个长期存活的 SyncManager 创建。
+    # 为每个嵌套对象临时调用 Manager() 会在 Windows 上产生无法互相
+    # 序列化的同步对象，并让 Manager 生命周期不可控。
+    if manager is None:
+        manager = Manager()
+
     # 检查是否是我们的自定义序列化字典
     if isinstance(value, dict) and '_type_' in value and '_value_' in value:
         type_ = value['_type_']
@@ -295,11 +301,14 @@ def deep_restore(value, depth=0):
         elif type_ == 'Dict':
             restored_dict = {}
             for k, v in val.items():
-                restored_dict[k] = deep_restore(v, depth + 1)
-            return Manager().dict(restored_dict)
+                restored_dict[k] = deep_restore(v, depth + 1, manager)
+            # shared_data 的顶层容器应保持普通 dict：其中包含原生
+            # multiprocessing.Value/Array，Windows 不允许把这些对象再
+            # pickle 进 Manager.dict。嵌套的原始 DictProxy 仍恢复为代理。
+            return restored_dict if depth == 0 else manager.dict(restored_dict)
         elif type_ == 'List':
-            restored_list = [deep_restore(v, depth + 1) for v in val]
-            return Manager().list(restored_list)
+            restored_list = [deep_restore(v, depth + 1, manager) for v in val]
+            return manager.list(restored_list)
 
     # 递归处理普通字典
     elif isinstance(value, dict):
@@ -332,22 +341,29 @@ def deep_restore(value, depth=0):
                     manager_proxy_items.append((k, v))
                 else:
                     # 其他项目直接递归恢复
-                    simple_items[k] = deep_restore(v, depth + 1)
+                    simple_items[k] = deep_restore(v, depth + 1, manager)
 
             # 并行恢复 Manager 代理
             if manager_proxy_items:
                 logger.info(f"[deep_restore] 检测到 {len(manager_proxy_items)} 个 Manager 代理需要恢复")
-                restored_proxies = _parallel_restore_manager_proxies(manager_proxy_items)
+                restored_proxies = {}
+                for key, proxy_value in manager_proxy_items:
+                    restored_proxies[key] = deep_restore(
+                        proxy_value, depth + 1, manager
+                    )
                 simple_items.update(restored_proxies)
 
             return simple_items
 
         # 普通字典递归处理
-        return {k: deep_restore(v, depth + 1) for k, v in value.items()}
+        return {
+            k: deep_restore(v, depth + 1, manager)
+            for k, v in value.items()
+        }
 
     # 递归处理普通列表
     elif isinstance(value, list):
-        return [deep_restore(v, depth + 1) for v in value]
+        return [deep_restore(v, depth + 1, manager) for v in value]
 
     # 如果不是以上任何一种，直接返回值
     return value

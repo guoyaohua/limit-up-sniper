@@ -225,8 +225,9 @@ PENDING → RUNNING → STOPPED
 
 **配置**：
 - SMTP 服务器：`smtp.qq.com:465` (SSL)
-- 发件人：`<redacted-email>`
-- 密码：环境变量 `QQ_MAIL_TOKEN`
+- 发件人：环境变量 `SMTP_SENDER`
+- SMTP 账户、密码及收发件地址：环境变量 `SMTP_USERNAME`、
+  `SMTP_PASSWORD`、`SMTP_SENDER`、`SMTP_RECIPIENT`
 
 ### 5.3 `send_html_email(subject, html_content, attachments=None)`
 

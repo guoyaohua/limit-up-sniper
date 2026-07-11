@@ -26,7 +26,7 @@ COPILOT_DEFAULT_MODEL = "gemini-3-pro-preview"
 # ============================================================
 # Azure AI Foundry 配置
 # ============================================================
-AZURE_ENDPOINT = '<redacted>'
+AZURE_ENDPOINT = os.environ.get("AZURE_ENDPOINT", "")
 # 从环境变量读取 API Key，避免明文存储
 AZURE_API_KEY = os.environ.get("AZURE_API_KEY", "")
 AZURE_DEFAULT_MODEL = "DeepSeek-V3.2-Speciale"
@@ -59,7 +59,9 @@ AZURE_VISION_MODELS = [
 # ============================================================
 # 阿里云百炼（DashScope OpenAI 兼容）配置
 # ============================================================
-DASHSCOPE_ENDPOINT = "https://coding.dashscope.aliyuncs.com/v1"
+DASHSCOPE_ENDPOINT = os.environ.get(
+    "DASHSCOPE_ENDPOINT", "https://coding.dashscope.aliyuncs.com/v1"
+)
 # 从环境变量读取 API Key，避免明文存储
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 DASHSCOPE_DEFAULT_MODEL = "MiniMax-M2.5"

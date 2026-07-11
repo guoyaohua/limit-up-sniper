@@ -17,6 +17,7 @@
 | [数据采集](scraper.md) | 东方财富/同花顺数据抓取、反爬策略 | 开发 |
 | [Level2 行情处理](level2.md) | Level2 逐笔委托/成交数据处理架构 | 开发（高级） |
 | [基础设施](infrastructure.md) | 进程管理、枚举定义、工具函数、日志与邮件 | 开发 |
+| [迁移策略复盘](strategy-review-2025-12-23_2026-01-12.md) | 12 日旧报告聚合、回归保护和验证门槛 | 策略研究 |
 
 ## 快速了解
 
@@ -31,7 +32,7 @@
 
 | 组件 | 技术 |
 |------|------|
-| 语言 | Python 3.8+ |
+| 语言 | Python 3.10+（CI 使用 3.11） |
 | 交易接口 | XTQuant (QMT 量化交易) |
 | 数据源 | XTQuant、东方财富 API、同花顺爬虫、akshare |
 | LLM 集成 | DashScope (通义千问)、Azure OpenAI、Copilot Vision |

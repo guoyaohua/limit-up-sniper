@@ -1,0 +1,17 @@
+akshare
+aiohttp
+beautifulsoup4
+fake-useragent
+joblib
+loguru
+msgpack
+numpy
+openai
+pandas
+pyarrow
+playwright
+requests
+schedule
+selenium
+tqdm
+httpx

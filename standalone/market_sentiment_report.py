@@ -974,30 +974,17 @@ def log_market_sentiment_summary(shared_data: Dict[str, Any],
         # 从shared_data中提取必要的配置
         debug_mode = shared_data.get('DEBUG_MODE', False)
 
-        # # FTP配置
-        # ftp_host = '<redacted>'
-        # ftp_username = '<redacted>'
-        # ftp_password = '<redacted>'
-
-        # # FTP配置 https://dash.infinityfree.com/
-        # ftp_host = '<redacted>'
-        # ftp_username = '<redacted>'
-        # ftp_password = '<redacted>'
-
-        # FTP配置 https://profreehost.com/
-        # https://gyh168.liveblog365.com/
-        # ftp_host = '<redacted>'
-        # ftp_username = '<redacted>'
-        # ftp_password = '<redacted>'
-
-        # Azure FTPS 连接配置
-        ftp_host = '<redacted>'  # 去掉协议前缀和路径
-        ftp_username = '<redacted>'  # 用户名中的$需要转义
-        ftp_password = '<redacted>'
+        # 可选 FTPS 配置。缺少任一凭据时仅生成本地报告，不执行同步。
+        ftp_host = os.getenv('REPORT_FTP_HOST')
+        ftp_username = os.getenv('REPORT_FTP_USERNAME')
+        ftp_password = os.getenv('REPORT_FTP_PASSWORD')
+        ftp_remote_dir = os.getenv(
+            'REPORT_FTP_REMOTE_DIR', '/site/wwwroot/reports'
+        )
 
         # 创建报告生成器实例，包含FTP配置
         reporter = MarketSentimentReporter(debug_mode=debug_mode,
-                                           remote_dir="/site/wwwroot/reports",
+                                           remote_dir=ftp_remote_dir,
                                            folder_name=folder_name,
                                            ftp_host=ftp_host,
                                            ftp_username=ftp_username,

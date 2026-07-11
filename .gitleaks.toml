@@ -1,0 +1,8 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Public placeholders and generated test fixtures"
+paths = [
+  '''(^|/)\.env\.example$''',
+]

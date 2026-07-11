@@ -10,18 +10,9 @@ import pickle
 import os
 import sys
 from datetime import datetime
-from multiprocessing import Manager
+from loguru import logger
 
-
-# Import the serialization and restoration logic directly from the main script
-# This avoids code duplication and ensures consistency.
-from 打板策略_v1 import (
-    save_shared_data,
-    load_shared_data,
-    deep_serialize,
-    deep_restore,
-    logger
-)
+from data.serialization import deep_serialize, deep_restore
 
 def load_shared_data_backup(backup_file_path):
     """
@@ -40,22 +31,15 @@ def load_shared_data_backup(backup_file_path):
             logger.error(f"错误: 备份文件不存在: {backup_file_path}")
             return None
             
-        with Manager() as manager:
-            with open(backup_file_path, 'rb') as f:
-                # Load the raw serialized data
-                serializable_data = pickle.load(f)
-            
-            logger.info(f"成功加载序列化数据。")
-            
-            # Restore the data into manager objects
-            restored_manager_data = deep_restore(manager, serializable_data)
-            
-            # Serialize it back into a plain dictionary for inspection.
-            # This is the "dead" representation that is safe to view.
-            final_data = deep_serialize(restored_manager_data)
-            
-            logger.info(f"共享数据恢复完成。")
-            return final_data
+        with open(backup_file_path, 'rb') as f:
+            serializable_data = pickle.load(f)
+
+        logger.info("成功加载序列化数据。")
+        restored_data = deep_restore(serializable_data)
+        final_data = deep_serialize(restored_data)
+
+        logger.info("共享数据恢复完成。")
+        return final_data
         
     except Exception as e:
         logger.error(f"加载共享数据失败: {e}")
@@ -96,7 +80,7 @@ def main():
     backup_file = sys.argv[1]
     
     # 加载数据
-    serializable_data = load_shared_data(backup_file)
+    serializable_data = load_shared_data_backup(backup_file)
     
     if serializable_data:
         # 转换为普通字典

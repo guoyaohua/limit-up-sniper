@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import os
 import re
 import json
 import aiohttp
@@ -22,7 +23,13 @@ class MarketAnalysisScraper:
     """盘面分析数据抓取器"""
     
     # 盘面分析页面 URL
-    MARKET_ANALYSIS_URL = "https://eq.10jqka.com.cn/webpage/kamis-renderer/index.html?token=<redacted>"
+    MARKET_ANALYSIS_URL = os.getenv(
+        'THS_MARKET_ANALYSIS_URL',
+        'https://eq.10jqka.com.cn/webpage/kamis-renderer/index.html',
+    )
+    token = os.getenv('THS_MARKET_ANALYSIS_TOKEN', '')
+    if token:
+        MARKET_ANALYSIS_URL = f'{MARKET_ANALYSIS_URL}?token={token}'
     
     # API URLs
     TURNOVER_API_URL = "https://dq.10jqka.com.cn/fuyao/market_analysis_api/chart/v1/get_chart_data?chart_key=turnover_minute"
