@@ -78,7 +78,7 @@ class ReviewConfig:
     MARKET_CLOSE_TIME = "15:00"
 
     # Strategy version
-    STRATEGY_VERSION = "v2.1"
+    STRATEGY_VERSION = "v1.0"
     STRATEGY_NAME = "FirstLimitUp"
     
     # Trading mode: 'shadow' for shadow signal mode, 'live' for live trading mode

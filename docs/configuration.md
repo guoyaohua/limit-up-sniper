@@ -6,7 +6,7 @@
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `VERSION` | str | `'v2.4'` | 策略版本号 |
+| `VERSION` | str | `'v1.0'` | 策略版本号 |
 | `DEBUG_MODE` | bool | `False` | 调试模式（使用模拟交易器） |
 | `ENABLE_SHADOW_SIGNAL` | bool | `False` | 影子信号模式（并行回测） |
 | `IS_LIVE_TRADING` | bool | `not DEBUG_MODE` | 实盘交易开关 |
