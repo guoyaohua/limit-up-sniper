@@ -162,8 +162,8 @@ PowerShell 示例：
 ```powershell
 $env:LIMIT_UP_CLIENT_NAME = 'GJ_SIM'
 $env:LIMIT_UP_EXECUTION_MODE = 'simulation'
-$env:GJ_SIM_QMT_CLIENT_PATH = '<redacted-qmt-path>'
-$env:GJ_SIM_STOCK_ACCOUNT = '<redacted-account>'
+$env:GJ_SIM_QMT_CLIENT_PATH = '<path-to-qmt-userdata-mini>'
+$env:GJ_SIM_STOCK_ACCOUNT = '<account-id>'
 ```
 
 邮件与可选 FTPS 报告发布分别使用 `SMTP_*` 和 `REPORT_FTP_*` 环境变量；
