@@ -29,6 +29,7 @@ from config import (
     IWENCAI_DOWNLOAD_DIR, IWENCAI_BROWSER_USER_DATA_DIR,
     IWENCAI_HEADLESS,
     IWENCAI_PAGE_SIZE, IWENCAI_MAX_PAGES,
+    CLIENT_NAME, CLIENT_PATH, STOCK_ACCOUNT,
 )
 from infra.common_enums import *
 from infra.utils import send_email, init_logger
@@ -105,6 +106,16 @@ def main():
     PRE_TRADE_DATE = get_pretrade_date(TODAY)
     try:
         from xtquant import xtdata
+
+        # 显示当前交易客户端信息
+        mode_label = '实盘' if IS_LIVE_TRADING else '模拟'
+        print('=' * 50)
+        print(f'  交易客户端 : {CLIENT_NAME}')
+        print(f'  客户端路径 : {CLIENT_PATH}')
+        print(f'  资金账号   : {STOCK_ACCOUNT}')
+        print(f'  交易模式   : {mode_label}')
+        print(f'  策略版本   : {VERSION}')
+        print('=' * 50)
 
         # 实盘交易
         if IS_LIVE_TRADING:
