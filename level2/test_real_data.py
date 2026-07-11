@@ -36,7 +36,10 @@ from infra.utils import init_logger
 # 初始化日志记录器
 init_logger(
     os.path.basename(__file__)[:-3],  # 使用脚本文件名作为日志名称
-    log_dir=rf'G:\Logs\Level2',  # 日志文件存放目录
+    log_dir=os.path.join(
+        os.getenv('LIMIT_UP_LOG_DIR', os.path.join('logs', 'monitor')),
+        'Level2',
+    ),
     verbose=True)  # 是否在控制台打印日志
 
 
