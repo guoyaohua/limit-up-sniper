@@ -270,7 +270,7 @@ scripts\run_strategy.bat
 
 | 组件 | 技术 |
 |------|------|
-| 语言 | Python 3.8+ |
+| 语言 | Python 3.10+（CI 使用 3.11） |
 | 交易接口 | XTQuant (QMT 量化交易) |
 | 数据源 | XTQuant、东方财富 API、同花顺爬虫、akshare |
 | LLM | DashScope (通义千问)、Azure OpenAI、Copilot Vision |
