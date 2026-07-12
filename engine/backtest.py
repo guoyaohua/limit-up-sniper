@@ -127,14 +127,11 @@ def calculate_performance(
     fees = sum(fill.fees for fill in broker.fills)
     buy_codes = {fill.stock_code for fill in broker.fills if fill.side == "BUY"}
     limit_up_stats = getattr(broker, "_backtest_limit_up_stats", {})
-    entry_codes = set(limit_up_stats.get("entry_codes", ()))
-    ever_sealed_codes = set(limit_up_stats.get("ever_sealed_codes", ()))
-    closed_sealed_codes = set(limit_up_stats.get("closed_sealed_codes", ()))
-    broken_after_seal_codes = set(
-        limit_up_stats.get("broken_after_seal_codes", ())
-    )
-    limit_up_entries = len(entry_codes)
-    sealed_through_close = len(closed_sealed_codes)
+    entries = list(limit_up_stats.get("entries", ()))
+    limit_up_entries = len(entries)
+    sealed_at_least_once = sum(bool(entry["ever_sealed"]) for entry in entries)
+    sealed_through_close = sum(bool(entry["sealed_at_close"]) for entry in entries)
+    broken_after_seal = sum(bool(entry["broken_after_seal"]) for entry in entries)
     return {
         "initial_cash": broker.config.initial_cash,
         "final_equity": final_snapshot["equity"],
@@ -161,9 +158,9 @@ def calculate_performance(
         "tick_batch_count": total_batches,
         "bought_stock_count": len(buy_codes),
         "limit_up_entry_count": limit_up_entries,
-        "sealed_at_least_once_count": len(ever_sealed_codes),
+        "sealed_at_least_once_count": sealed_at_least_once,
         "sealed_through_close_count": sealed_through_close,
-        "broken_after_seal_count": len(broken_after_seal_codes),
+        "broken_after_seal_count": broken_after_seal,
         "seal_success_rate": (
             round(sealed_through_close / limit_up_entries, 8)
             if limit_up_entries
@@ -245,10 +242,10 @@ class BacktestEngine:
         batches = 0
         last_batch: TickBatch | None = None
         latest_ticks: dict[str, Mapping[str, Any]] = {}
-        limit_up_entries: set[str] = set()
-        ever_sealed: set[str] = set()
-        broken_after_seal: set[str] = set()
-        pending_signals: list[BacktestSignal] = []
+        limit_up_entries: list[dict[str, Any]] = []
+        pending_signals: list[tuple[str, BacktestSignal]] = []
+        expired_signal_count = 0
+        current_trade_date = ""
         paths = discover_tick_files(tick_paths)
         if not paths:
             raise ValueError("no Tick archive files found")
@@ -270,29 +267,50 @@ class BacktestEngine:
         ) as broker:
             curve.append(broker.snapshot(0))
             for batch in iter_tick_batches(paths, stock_codes=stock_codes):
+                if current_trade_date and batch.trade_date != current_trade_date:
+                    for entry in limit_up_entries:
+                        if (
+                            entry["trade_date"] == current_trade_date
+                            and entry["sealed_at_close"] is None
+                        ):
+                            closing_tick = latest_ticks.get(entry["stock_code"])
+                            entry["sealed_at_close"] = bool(
+                                closing_tick and _is_limit_up_tick(closing_tick)
+                            )
+                    expired_signal_count += len(pending_signals)
+                    pending_signals.clear()
+                    latest_ticks.clear()
+                current_trade_date = batch.trade_date
                 last_batch = batch
                 batches += 1
                 latest_ticks.update(batch.ticks)
                 broker.mark_many(batch.ticks)
-                for code in limit_up_entries:
-                    tick = batch.ticks.get(code)
+                for entry in limit_up_entries:
+                    if entry["trade_date"] != batch.trade_date:
+                        continue
+                    tick = batch.ticks.get(entry["stock_code"])
                     if tick is None:
                         continue
                     if _is_limit_up_tick(tick):
-                        ever_sealed.add(code)
-                    elif code in ever_sealed:
-                        broken_after_seal.add(code)
+                        entry["ever_sealed"] = True
+                    elif entry["ever_sealed"]:
+                        entry["broken_after_seal"] = True
 
                 ready: list[BacktestSignal] = []
                 waiting: list[BacktestSignal] = []
-                for signal in pending_signals:
-                    (ready if signal.stock_code in batch.ticks else waiting).append(
-                        signal
-                    )
+                for signal_date, signal in pending_signals:
+                    if signal_date != batch.trade_date:
+                        expired_signal_count += 1
+                    elif signal.stock_code in batch.ticks:
+                        ready.append(signal)
+                    else:
+                        waiting.append((signal_date, signal))
                 pending_signals = waiting
                 current_signals = list(self._signals(batch, broker))
                 if self.config.execute_on_next_tick:
-                    pending_signals.extend(current_signals)
+                    pending_signals.extend(
+                        (batch.trade_date, signal) for signal in current_signals
+                    )
                 else:
                     ready.extend(current_signals)
 
@@ -301,9 +319,18 @@ class BacktestEngine:
                     if fill:
                         fills.append(asdict(fill))
                         if fill.side == "BUY" and signal.limit_up_entry:
-                            limit_up_entries.add(fill.stock_code)
-                            if _is_limit_up_tick(batch.ticks[fill.stock_code]):
-                                ever_sealed.add(fill.stock_code)
+                            is_sealed = _is_limit_up_tick(
+                                batch.ticks[fill.stock_code]
+                            )
+                            limit_up_entries.append({
+                                "stock_code": fill.stock_code,
+                                "trade_date": batch.trade_date,
+                                "entry_time_ms": fill.timestamp_ms,
+                                "signal_id": signal.signal_id,
+                                "ever_sealed": is_sealed,
+                                "broken_after_seal": False,
+                                "sealed_at_close": None,
+                            })
                 if batches % self.config.sample_equity_every_batches == 0:
                     curve.append(broker.checkpoint_equity(batch.event_time_ms))
 
@@ -322,16 +349,14 @@ class BacktestEngine:
                             fills.append(asdict(fill))
             if last_batch is not None:
                 curve.append(broker.checkpoint_equity(last_batch.event_time_ms))
-            closed_sealed = {
-                code
-                for code in limit_up_entries
-                if code in latest_ticks and _is_limit_up_tick(latest_ticks[code])
-            }
+            for entry in limit_up_entries:
+                if entry["sealed_at_close"] is None:
+                    closing_tick = latest_ticks.get(entry["stock_code"])
+                    entry["sealed_at_close"] = bool(
+                        closing_tick and _is_limit_up_tick(closing_tick)
+                    )
             broker._backtest_limit_up_stats = {
-                "entry_codes": limit_up_entries,
-                "ever_sealed_codes": ever_sealed,
-                "closed_sealed_codes": closed_sealed,
-                "broken_after_seal_codes": broken_after_seal,
+                "entries": limit_up_entries,
             }
             metrics = calculate_performance(broker, curve, total_batches=batches)
             trades = broker.closed_trades()
@@ -347,6 +372,8 @@ class BacktestEngine:
             "closed_trades": trades,
             "open_positions": positions,
             "unexecuted_signal_count": len(pending_signals),
+            "expired_signal_count": expired_signal_count,
+            "limit_up_entries": limit_up_entries,
         }
 
 

@@ -25,8 +25,13 @@ def _tick(
     }
 
 
-def _archive(tmp_path: Path, batches: list[dict]) -> Path:
-    writer = TickArchiveWriter(tmp_path, "20260710", session_id="backtest")
+def _archive(
+    tmp_path: Path,
+    batches: list[dict],
+    *,
+    trade_date: str = "20260710",
+) -> Path:
+    writer = TickArchiveWriter(tmp_path, trade_date, session_id="backtest")
     for batch in batches:
         writer.write_batch(batch)
     return writer.close()
@@ -180,3 +185,82 @@ def test_invalid_archive_is_rejected_by_default(tmp_path: Path):
 
     with pytest.raises(ValueError, match="integrity checks"):
         BacktestEngine(lambda batch, broker: []).run(archive)
+
+
+def test_pending_signal_expires_at_trading_day_boundary(tmp_path: Path):
+    first = _archive(
+        tmp_path,
+        [{"000001.SZ": _tick(1_000, 10.0)}],
+        trade_date="20260710",
+    )
+    second = _archive(
+        tmp_path,
+        [{"000001.SZ": _tick(2_000, 11.0)}],
+        trade_date="20260711",
+    )
+
+    class Strategy:
+        sent = False
+
+        def on_tick_batch(self, batch, broker):
+            if not self.sent:
+                self.sent = True
+                return [BacktestSignal("000001.SZ", "BUY", quantity=100)]
+            return []
+
+    result = BacktestEngine(Strategy(), broker_config=_broker_config()).run(
+        [first, second]
+    )
+
+    assert result["fills"] == []
+    assert result["expired_signal_count"] == 1
+    assert result["unexecuted_signal_count"] == 0
+
+
+def test_seal_rate_counts_each_entry_and_uses_its_day_close(tmp_path: Path):
+    first = _archive(
+        tmp_path,
+        [
+            {"000001.SZ": _tick(1_000, 10.9)},
+            {"000001.SZ": _tick(2_000, 10.95)},
+            {"000001.SZ": _tick(3_000, 11.0, sealed=True)},
+        ],
+        trade_date="20260710",
+    )
+    second = _archive(
+        tmp_path,
+        [
+            {"000001.SZ": _tick(4_000, 10.9)},
+            {"000001.SZ": _tick(5_000, 10.95)},
+            {"000001.SZ": _tick(6_000, 10.8)},
+        ],
+        trade_date="20260711",
+    )
+
+    class Strategy:
+        sent_dates = set()
+
+        def on_tick_batch(self, batch, broker):
+            if batch.trade_date not in self.sent_dates:
+                self.sent_dates.add(batch.trade_date)
+                return [BacktestSignal(
+                    "000001.SZ",
+                    "BUY",
+                    quantity=100,
+                    signal_id=f"entry-{batch.trade_date}",
+                    limit_up_entry=True,
+                )]
+            return []
+
+    result = BacktestEngine(Strategy(), broker_config=_broker_config()).run(
+        [first, second]
+    )
+    metrics = result["metrics"]
+
+    assert metrics["limit_up_entry_count"] == 2
+    assert metrics["sealed_through_close_count"] == 1
+    assert metrics["seal_success_rate"] == 0.5
+    assert [entry["sealed_at_close"] for entry in result["limit_up_entries"]] == [
+        True,
+        False,
+    ]
