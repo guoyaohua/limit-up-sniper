@@ -80,6 +80,10 @@ def capture(args: argparse.Namespace) -> Path:
         maxsize=args.queue_size
     )
     stop_event = threading.Event()
+    producer_done = threading.Event()
+    accepting_callbacks = True
+    callback_lock = threading.Lock()
+    consumer_errors: queue.Queue[BaseException] = queue.Queue(maxsize=1)
     dropped_batches = 0
     saved_records = 0
 
@@ -89,28 +93,55 @@ def capture(args: argparse.Namespace) -> Path:
 
     def consume() -> None:
         nonlocal saved_records
-        while not stop_event.is_set() or not batch_queue.empty():
+        try:
+            # ``stop_event`` only asks the subscription loop to stop.  The
+            # writer must stay alive until unsubscribe has completed and no
+            # callback can enqueue another batch, otherwise the final callback
+            # can be silently lost at shutdown.
+            while not producer_done.is_set() or not batch_queue.empty():
+                try:
+                    received_at_ns, datas = batch_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                try:
+                    saved_records += writer.write_batch(
+                        datas, received_at_ns=received_at_ns
+                    )
+                finally:
+                    batch_queue.task_done()
+        except BaseException as exc:
             try:
-                received_at_ns, datas = batch_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            saved_records += writer.write_batch(datas, received_at_ns=received_at_ns)
-            batch_queue.task_done()
+                consumer_errors.put_nowait(exc)
+            except queue.Full:
+                pass
+            stop_event.set()
 
     def on_data(datas) -> None:
         nonlocal dropped_batches
         if not datas:
             return
-        # Never block XTQuant's callback thread. A full queue is made visible in
-        # manifest.json so incomplete datasets cannot be mistaken for valid ones.
-        try:
-            batch_queue.put_nowait((time.time_ns(), dict(datas)))
-        except queue.Full:
-            dropped_batches += 1
+        # Serialize callback admission with shutdown.  unsubscribe_quote() may
+        # return while an already-running callback is finishing; after this
+        # lock is closed no producer can enqueue behind the consumer's exit.
+        with callback_lock:
+            if not accepting_callbacks:
+                return
+            # Never block XTQuant's callback thread.  On overflow fail the
+            # capture immediately; the manifest records the loss so this
+            # segment can never be accepted by a rigorous backtest.
+            try:
+                batch_queue.put_nowait((time.time_ns(), dict(datas)))
+            except queue.Full:
+                dropped_batches += 1
+                stop_event.set()
 
-    consumer = threading.Thread(target=consume, name="tick-archive-writer")
+    consumer = threading.Thread(
+        target=consume, name="tick-archive-writer", daemon=True
+    )
     consumer.start()
     subscribe_id = -1
+    archive_path: Path | None = None
+    consumer_error: BaseException | None = None
     try:
         xtdata.reconnect(args.host, args.port)
         stocks = _select_stocks(xtdata, args.sector, args.include_star)
@@ -138,18 +169,40 @@ def capture(args: argparse.Namespace) -> Path:
                 xtdata.unsubscribe_quote(subscribe_id)
             except Exception:
                 pass
+        # Closing admission under the same lock used by callbacks guarantees
+        # that every accepted batch is visible before ``producer_done``.
+        with callback_lock:
+            accepting_callbacks = False
+        producer_done.set()
         stop_event.set()
         consumer.join(timeout=120)
         if consumer.is_alive():
             raise RuntimeError("归档写入线程未能在 120 秒内排空队列")
-        archive_path = writer.close(dropped_batches=dropped_batches)
+        if not consumer_errors.empty():
+            consumer_error = consumer_errors.get_nowait()
+        # A writer exception may happen after some valid records were flushed.
+        # Mark that segment incomplete as well, so verification rejects it even
+        # if an operator overlooks this process's non-zero exit status.
+        archive_path = writer.close(
+            dropped_batches=dropped_batches + int(consumer_error is not None)
+        )
+
+    if consumer_error is not None:
+        raise RuntimeError(
+            f"Tick 归档写入失败，文件不可用于回测: {archive_path}"
+        ) from consumer_error
+    if dropped_batches:
+        raise RuntimeError(
+            f"Tick 采集丢失 {dropped_batches} 个回调批次，文件不可用于回测: "
+            f"{archive_path}"
+        )
+    if saved_records <= 0:
+        raise RuntimeError(f"Tick 归档为空，文件不可用于回测: {archive_path}")
 
     print(
         f"保存完成: {saved_records} 条, 丢弃批次: {dropped_batches}, "
         f"文件: {archive_path}"
     )
-    if dropped_batches:
-        print("警告：存在丢弃批次，该日数据不能用于严谨回测。", file=sys.stderr)
     if args.verify:
         quality = verify_tick_archive(archive_path)
         print(quality)
