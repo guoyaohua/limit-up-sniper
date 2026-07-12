@@ -4,6 +4,11 @@
 
 # Limit-Up Sniper
 
+[![CI](https://github.com/guoyaohua/limit-up-sniper/actions/workflows/secret-scan.yml/badge.svg)](https://github.com/guoyaohua/limit-up-sniper/actions/workflows/secret-scan.yml)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows&logoColor=white)](https://github.com/guoyaohua/limit-up-sniper#环境要求)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 **A股首板涨停打板策略自动化交易系统 v1.0**
 
 > 一套面向中国 A 股市场的全自动化涨停板交易系统，融合量化选股、实时行情处理、多因子动态决策、LLM 板块预测、动态追踪止损等技术，实现从盘前分析到盘后复盘的全流程自动化。
@@ -338,6 +343,12 @@ python -m pytest test/test_sector_monitor.py
 ## 风险提示
 
 本系统仅供量化交易研究与学习使用。股票投资有风险，自动化交易可能导致快速亏损。请在充分了解风险的前提下使用，并始终以 `LIMIT_UP_EXECUTION_MODE=simulation` 进行充分测试后再考虑实盘运行。
+
+## 参与贡献
+
+欢迎提交 Bug、策略改进和工程优化。策略变更应提供清晰的指标口径、数据区间、
+交易成本假设和样本外验证结果，并说明如何排除未来函数与幸存者偏差。完整流程见
+[CONTRIBUTING.md](CONTRIBUTING.md)；安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。
 
 ## 安全与许可
 

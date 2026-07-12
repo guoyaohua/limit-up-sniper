@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 私下报告安全漏洞
+    url: https://github.com/guoyaohua/limit-up-sniper/security/advisories/new
+    about: 请勿在公开 Issue 中披露漏洞、凭据、账号或交易数据。
+  - name: 使用文档
+    url: https://github.com/guoyaohua/limit-up-sniper/blob/main/docs/index.md
+    about: 提问前请先查看架构、配置、策略与运行文档。

@@ -1,0 +1,81 @@
+name: 策略优化提案
+description: 提议可验证的信号、风控、成交模型或参数改进
+title: "[Strategy] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        策略提升需要样本外证据。仅展示单日收益、最佳参数或未计成本结果的提案无法判断是否有效。
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: 策略假设
+      description: 描述市场机制、信号产生时间以及为什么预期有效。
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: 建议变更
+      description: 说明规则、参数范围、影响模块及默认值。
+    validations:
+      required: true
+  - type: textarea
+    id: baseline
+    attributes:
+      label: 基线与数据
+      placeholder: |
+        基线 commit / 版本：
+        日期范围与股票池：
+        Tick / 分钟 / 日线数据来源：
+        样本内、验证和样本外划分：
+    validations:
+      required: true
+  - type: textarea
+    id: execution_model
+    attributes:
+      label: 成交与成本模型
+      description: 说明排队、涨跌停不可成交、滑点、佣金、印花税和最小交易单位。
+    validations:
+      required: true
+  - type: textarea
+    id: metrics
+    attributes:
+      label: 对比结果
+      description: 至少提供样本量、封板率、收益、最大回撤、胜率和盈亏比，并说明封板率口径。
+      placeholder: |
+        指标 | 基线 | 提案 | 样本外差异
+        --- | ---: | ---: | ---:
+        成交数 | | |
+        封板率 | | |
+        累计收益 | | |
+        最大回撤 | | |
+    validations:
+      required: true
+  - type: textarea
+    id: biases
+    attributes:
+      label: 偏差与稳健性检查
+      description: 说明如何排除未来函数、幸存者偏差和过拟合，以及不同市场状态下的结果。
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: 风险与回滚
+      description: 说明失效场景、监控指标和回滚条件。
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交确认
+      options:
+        - label: 所有决策特征的时间戳均不晚于对应决策时间。
+          required: true
+        - label: 结果包含未参与调参的样本外区间。
+          required: true
+        - label: 内容不包含凭据、个人信息或未经授权的行情数据。
+          required: true

@@ -1,0 +1,80 @@
+name: Bug 报告
+description: 报告可复现的程序错误或异常行为
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请先删除账号、密钥、Cookie、券商路径和未脱敏交易数据。安全漏洞请使用 GitHub Security Advisories 私下报告。
+  - type: dropdown
+    id: component
+    attributes:
+      label: 影响模块
+      options:
+        - 核心策略
+        - Tick / Level2 行情
+        - 模拟或影子执行
+        - 实盘执行
+        - 回测与复盘
+        - 数据采集
+        - 配置、文档或其他
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 执行模式
+      options:
+        - 离线测试
+        - simulation
+        - shadow
+        - live
+        - 不适用
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 说明实际行为、预期行为及影响。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 最小复现步骤
+      placeholder: |
+        1. 使用配置……
+        2. 运行命令……
+        3. 输入/行情条件……
+        4. 出现……
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境
+      placeholder: |
+        Commit: 
+        Python: 
+        Windows: 
+        QMT / XTQuant（如适用）: 
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 脱敏日志或测试结果
+      description: 请粘贴最小必要内容；不要上传账号、持仓、密钥、Cookie 或受限行情。
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交确认
+      options:
+        - label: 已搜索现有 Issue，未发现相同问题。
+          required: true
+        - label: 内容已脱敏，且不包含凭据、个人信息或未经授权的行情数据。
+          required: true
