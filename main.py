@@ -166,6 +166,7 @@ def main():
         for _ in range(TICK_PROCESSOR_COUNT)
     ]
     order_queue = Queue(maxsize=100)
+    paper_market_queue = Queue(maxsize=64) if not IS_LIVE_TRADING else None
 
     # 影子模式
     shadow_tick_queue = ([
@@ -173,6 +174,7 @@ def main():
         for _ in range(SHADOW_TICK_PROCESSOR_COUNT)
     ] if ENABLE_SHADOW_SIGNAL else None)
     shadow_order_queue = Queue(maxsize=100) if ENABLE_SHADOW_SIGNAL else None
+    shadow_market_queue = Queue(maxsize=64) if ENABLE_SHADOW_SIGNAL else None
 
     # 初始化 TaskManager
     task_manager = get_task_manager(stop_time=STOP_TIME)
@@ -243,7 +245,7 @@ def main():
         task_manager.register_task(
             TaskInfo(name='交易模块',
                      target=run_xt_trader_simulator,
-                     args=(order_queue, shared_data),
+                     args=(order_queue, shared_data, False, paper_market_queue),
                      task_type="thread",
                      daemon=True,
                      restart_on_failure=False))
@@ -280,7 +282,8 @@ def main():
         task_manager.register_task(
             TaskInfo(name='[影子模式] 交易模块',
                      target=run_xt_trader_simulator,
-                     args=(shadow_order_queue, shadow_shared_data, True),
+                     args=(shadow_order_queue, shadow_shared_data, True,
+                           shadow_market_queue),
                      task_type="thread",
                      daemon=True,
                      restart_on_failure=False))
@@ -316,8 +319,9 @@ def main():
     # 订阅全推行情
     try:
         while True:
-            create_whole_quote_task(stock_pool, stock_info_dict, tick_queue,
-                                    shadow_tick_queue)
+            create_whole_quote_task(
+                stock_pool, stock_info_dict, tick_queue, shadow_tick_queue,
+                paper_market_queue, shadow_market_queue)
             if datetime.now().time() >= STOP_TIME:
                 logger.warning('程序已到达停止时间，退出全市场行情订阅')
                 break

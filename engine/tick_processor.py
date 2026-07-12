@@ -8,7 +8,7 @@ check_order_successed 模拟成交判断、create_whole_quote_task 订阅任务�
 import time
 import traceback
 import zlib
-from queue import Empty
+from queue import Empty, Full
 from functools import partial
 from multiprocessing import current_process, Value
 from datetime import datetime, time as dt_time
@@ -62,7 +62,9 @@ def on_data(datas,
             shadow_tick_queue,
             stock_info_dict,
             stop_flag,
-            heartbeat_monitor=None):
+            heartbeat_monitor=None,
+            paper_market_queue=None,
+            shadow_market_queue=None):
     """分笔行情回调函数
 
     tick - 分笔数据
@@ -100,6 +102,10 @@ def on_data(datas,
         _dispatch_ticks(datas, tick_queue)
         if shadow_tick_queue:
             _dispatch_ticks(datas, shadow_tick_queue)
+        if paper_market_queue is not None:
+            _put_latest_market(paper_market_queue, datas)
+        if shadow_market_queue is not None:
+            _put_latest_market(shadow_market_queue, datas)
 
         # 记录日志
         stock_code = list(datas.keys())[0]
@@ -163,6 +169,22 @@ def _queue_size(queues):
         return queues.qsize()
     except (AttributeError, NotImplementedError):
         return -1
+
+
+def _put_latest_market(market_queue, datas):
+    """Keep simulation marks fresh without ever blocking XTQuant callback."""
+    payload = dict(datas)
+    try:
+        market_queue.put_nowait(payload)
+    except Full:
+        try:
+            market_queue.get_nowait()
+        except Empty:
+            pass
+        try:
+            market_queue.put_nowait(payload)
+        except Full:
+            pass
 
 
 # ---------------------------------------------------------------------------- #
@@ -951,7 +973,9 @@ def process_tick_data(shared_data,
 def create_whole_quote_task(stock_pool,
                             stock_info_dict,
                             tick_queue,
-                            shadow_tick_queue=None):
+                            shadow_tick_queue=None,
+                            paper_market_queue=None,
+                            shadow_market_queue=None):
     """创建全推行情订阅任务
 
     Args:
@@ -983,7 +1007,9 @@ def create_whole_quote_task(stock_pool,
             shadow_tick_queue=shadow_tick_queue,
             stock_info_dict=stock_info_dict,
             stop_flag=stop_flag,
-            heartbeat_monitor=heartbeat_monitor)  # 传递心跳监控器
+            heartbeat_monitor=heartbeat_monitor,
+            paper_market_queue=paper_market_queue,
+            shadow_market_queue=shadow_market_queue)
         while subscribe_id < 0:
             subscribe_id = xtdata.subscribe_whole_quote(
                 stock_pool, callback=partial_on_data)
@@ -1066,6 +1092,7 @@ def create_whole_quote_task(stock_pool,
 
             # 重新订阅
             logger.warning(f'【进程退出】{current_process().name}，连接断开或回调异常，重新订阅')
-            create_whole_quote_task(stock_pool, stock_info_dict, tick_queue,
-                                    shadow_tick_queue)
+            create_whole_quote_task(
+                stock_pool, stock_info_dict, tick_queue, shadow_tick_queue,
+                paper_market_queue, shadow_market_queue)
             return
