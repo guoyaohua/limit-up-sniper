@@ -13,6 +13,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from engine.backtest import BacktestConfig, BacktestEngine, write_backtest_result
+from engine.event_replay import EventLogReplayStrategy, load_replay_events
 from engine.paper_broker import BrokerConfig
 
 
@@ -34,7 +35,13 @@ def _load_strategy(path: str, factory_name: str, settings: dict):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="使用归档 Tick 进行事件驱动回测")
     parser.add_argument("--ticks", nargs="+", required=True, help="归档文件或目录")
-    parser.add_argument("--strategy", required=True, help="策略插件 .py 路径")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--strategy", help="策略插件 .py 路径")
+    source.add_argument(
+        "--events",
+        nargs="+",
+        help="实盘/影子 output/trade_logs/YYYYMMDD/events.jsonl",
+    )
     parser.add_argument("--factory", default="create_strategy")
     parser.add_argument("--settings", default="{}", help="传给工厂函数的 JSON 对象")
     parser.add_argument(
@@ -62,6 +69,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="允许回放缺失 manifest/校验失败的数据；严谨回测不应使用",
     )
     parser.add_argument("--stocks", nargs="*", help="仅回放指定股票")
+    parser.add_argument(
+        "--event-source", choices=("primary", "shadow"), default="primary"
+    )
+    parser.add_argument(
+        "--accept-legacy-unlabelled-events",
+        action="store_true",
+        help="兼容旧事件日志；旧日志无法区分主策略与影子信号，结果须标记有歧义",
+    )
+    parser.add_argument(
+        "--event-buy-target-value",
+        type=float,
+        default=100_000.0,
+        help="事件日志没有委托数量时，每次买入目标市值",
+    )
     return parser
 
 
@@ -71,7 +92,18 @@ def main() -> int:
         settings = json.loads(args.settings)
         if not isinstance(settings, dict):
             raise ValueError("--settings 必须是 JSON 对象")
-        strategy = _load_strategy(args.strategy, args.factory, settings)
+        event_diagnostics = None
+        if args.events:
+            events, event_diagnostics = load_replay_events(
+                args.events,
+                source=args.event_source,
+                accept_legacy_unlabelled=args.accept_legacy_unlabelled_events,
+            )
+            strategy = EventLogReplayStrategy(
+                events, buy_target_value=args.event_buy_target_value
+            )
+        else:
+            strategy = _load_strategy(args.strategy, args.factory, settings)
         broker_config = BrokerConfig(
             initial_cash=args.initial_cash,
             commission_rate=args.commission_rate,
@@ -93,6 +125,11 @@ def main() -> int:
             ),
         )
         result = engine.run(args.ticks, stock_codes=args.stocks)
+        if event_diagnostics is not None:
+            result["event_log_diagnostics"] = {
+                **event_diagnostics,
+                **result.get("strategy_diagnostics", {}),
+            }
         output = write_backtest_result(result, args.output)
         print(json.dumps(result["metrics"], ensure_ascii=False, indent=2))
         print(f"完整结果: {output}")

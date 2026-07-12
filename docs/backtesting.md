@@ -75,6 +75,27 @@ python scripts/run_backtest.py `
   --output output/backtests/experiment-a.json
 ```
 
+也可以直接回放系统实际写出的决策事件，无需另写插件：
+
+```powershell
+python scripts/run_backtest.py `
+  --ticks output/tick_archive/20260710 `
+  --events output/trade_logs/20260710/events.jsonl `
+  --event-source primary `
+  --event-buy-target-value 100000 `
+  --output output/backtests/primary-20260710.json
+```
+
+`--event-source shadow` 可单独评估影子策略。新版事件带有 `signal_source`，默认拒绝
+无法区分主策略与影子策略的旧日志；若明确接受这一歧义，可加
+`--accept-legacy-unlabelled-events`，结果中的 `event_log_diagnostics` 会保留旧日志计数。
+由于旧事件没有实际委托数量，买入仓位由 `--event-buy-target-value` 统一指定；卖出按
+事件中的目标剩余仓位执行。
+
+事件回放使用日志 `timestamp` 对齐 Tick，决策只在时间到达后生效。扫板在下一笔该股
+Tick 撮合；排板使用事件快照重建前方队列，只有累计成交穿透“前方队列 + 本单”且全程
+封板才成交，开板、撤单或跨交易日都会使原队列永久失效。
+
 默认在信号生成后的下一笔该股票 Tick 执行，防止用产生信号的盘口同时成交。
 `--same-tick-execution` 只适合明确研究撮合敏感性；结论报告应注明使用了它。
 

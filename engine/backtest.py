@@ -35,6 +35,8 @@ class BacktestSignal:
     reason: str = ""
     signal_id: str = ""
     limit_up_entry: bool = False
+    respect_liquidity: bool = True
+    execute_on_current_tick: bool = False
 
     def __post_init__(self) -> None:
         if self.side.upper() not in {"BUY", "SELL"}:
@@ -268,6 +270,7 @@ class BacktestEngine:
             "limit_price": signal.limit_price,
             "reason": signal.reason,
             "signal_id": signal.signal_id,
+            "respect_liquidity": signal.respect_liquidity,
         }
         if signal.side.upper() == "BUY":
             return broker.buy(signal.stock_code, quantity, tick, **kwargs)
@@ -339,7 +342,7 @@ class BacktestEngine:
                         entry["broken_after_seal"] = True
 
                 ready: list[BacktestSignal] = []
-                waiting: list[BacktestSignal] = []
+                waiting: list[tuple[str, BacktestSignal]] = []
                 for signal_date, signal in pending_signals:
                     if signal_date != batch.trade_date:
                         expired_signal_count += 1
@@ -350,9 +353,11 @@ class BacktestEngine:
                 pending_signals = waiting
                 current_signals = list(self._signals(batch, broker))
                 if self.config.execute_on_next_tick:
-                    pending_signals.extend(
-                        (batch.trade_date, signal) for signal in current_signals
-                    )
+                    for signal in current_signals:
+                        if signal.execute_on_current_tick:
+                            ready.append(signal)
+                        else:
+                            pending_signals.append((batch.trade_date, signal))
                 else:
                     ready.extend(current_signals)
 
@@ -403,6 +408,10 @@ class BacktestEngine:
             metrics = calculate_performance(broker, curve, total_batches=batches)
             trades = broker.closed_trades()
             positions = broker.positions
+            diagnostics_method = getattr(self.strategy, "diagnostics", None)
+            strategy_diagnostics = (
+                diagnostics_method() if callable(diagnostics_method) else {}
+            )
 
         return {
             "schema_version": 1,
@@ -416,6 +425,7 @@ class BacktestEngine:
             "unexecuted_signal_count": len(pending_signals),
             "expired_signal_count": expired_signal_count,
             "limit_up_entries": limit_up_entries,
+            "strategy_diagnostics": strategy_diagnostics,
         }
 
 
