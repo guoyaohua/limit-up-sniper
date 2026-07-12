@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 760" role="img" aria-labelledby="title desc">
+  <title id="title">Limit-Up Sniper 首板策略流程</title>
+  <desc id="desc">从基础股票池、涨停基因和盘前多源发现，到盘中硬过滤、排板或扫板、模拟或实盘执行，再到卖出和复盘验证的完整流程。</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07182d"/>
+      <stop offset="1" stop-color="#123456"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#54d2ff"/>
+      <stop offset="1" stop-color="#8bffc7"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000" flood-opacity=".22"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M1 1l10 5-10 5z" fill="#80e4ff"/>
+    </marker>
+    <style>
+      .title { font: 700 34px "Segoe UI", "Microsoft YaHei", sans-serif; fill: #f4fbff; }
+      .subtitle { font: 400 16px "Segoe UI", "Microsoft YaHei", sans-serif; fill: #a9c6db; }
+      .step { font: 700 14px "Segoe UI", "Microsoft YaHei", sans-serif; letter-spacing: 1px; fill: #80e4ff; }
+      .heading { font: 700 22px "Segoe UI", "Microsoft YaHei", sans-serif; fill: #f4fbff; }
+      .body { font: 400 15px "Segoe UI", "Microsoft YaHei", sans-serif; fill: #c9ddeb; }
+      .small { font: 400 13px "Segoe UI", "Microsoft YaHei", sans-serif; fill: #a9c6db; }
+      .chip { font: 600 13px "Segoe UI", "Microsoft YaHei", sans-serif; fill: #07182d; }
+      .card { fill: #102c49; stroke: #2b5878; stroke-width: 1.5; }
+      .card-accent { fill: #133653; stroke: url(#accent); stroke-width: 2; }
+      .arrow { fill: none; stroke: #80e4ff; stroke-width: 3; marker-end: url(#arrow); }
+      .divider { stroke: #2b5878; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="760" rx="28" fill="url(#background)"/>
+  <text x="64" y="65" class="title">一只股票如何变成一笔交易</text>
+  <text x="64" y="94" class="subtitle">扩大的是候选发现范围；买入权限仍由实时行情与风控逐层收紧</text>
+
+  <g filter="url(#shadow)">
+    <rect x="55" y="135" width="250" height="230" rx="20" class="card"/>
+    <text x="79" y="169" class="step">01  基础池与历史股性</text>
+    <text x="79" y="207" class="heading">先排除不可做的票</text>
+    <text x="79" y="239" class="body">非 ST、非停牌、上市满 100 天</text>
+    <text x="79" y="265" class="body">流通市值、价格、成交额达标</text>
+    <text x="79" y="291" class="body">昨日涨停不进入今日首板池</text>
+    <line x1="79" y1="312" x2="281" y2="312" class="divider"/>
+    <text x="79" y="338" class="small">250 日股性 → 五因子百分位评分</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="370" y="135" width="250" height="230" rx="20" class="card"/>
+    <text x="394" y="169" class="step">02  盘前多源发现</text>
+    <text x="394" y="207" class="heading">补足首板候选召回</text>
+    <text x="394" y="239" class="body">1h / 24h 热股各 100</text>
+    <text x="394" y="265" class="body">概念 / 行业热点各 50</text>
+    <text x="394" y="291" class="body">涨停基因候选 500</text>
+    <line x1="394" y1="312" x2="596" y2="312" class="divider"/>
+    <text x="394" y="338" class="small">LLM 分 core / watch，本地证据复核</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="685" y="135" width="250" height="230" rx="20" class="card-accent"/>
+    <text x="709" y="169" class="step">03  盘中硬过滤</text>
+    <text x="709" y="207" class="heading">所有条件同时成立</text>
+    <text x="709" y="239" class="body">情绪、换手率、时段量比</text>
+    <text x="709" y="265" class="body">板块联动与领涨数量</text>
+    <text x="709" y="291" class="body">新鲜资金流、持仓集中度</text>
+    <line x1="709" y1="312" x2="911" y2="312" class="divider"/>
+    <text x="709" y="338" class="small">任一缺失 / 过期 / 不达标 → 不买</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1000" y="135" width="225" height="230" rx="20" class="card"/>
+    <text x="1024" y="169" class="step">04  触发方式</text>
+    <text x="1024" y="207" class="heading">排板 或 扫板</text>
+    <rect x="1024" y="229" width="74" height="28" rx="14" fill="#80e4ff"/>
+    <text x="1041" y="249" class="chip">排 板</text>
+    <text x="1024" y="282" class="small">已封板：封单 ≥ 动态门槛</text>
+    <rect x="1024" y="302" width="74" height="28" rx="14" fill="#8bffc7"/>
+    <text x="1041" y="322" class="chip">扫 板</text>
+    <text x="1024" y="352" class="small">卖一涨停：待吃金额收缩</text>
+  </g>
+
+  <path d="M305 250H358" class="arrow"/>
+  <path d="M620 250H673" class="arrow"/>
+  <path d="M935 250H988" class="arrow"/>
+
+  <path d="M1112 365V420H808" class="arrow"/>
+
+  <g filter="url(#shadow)">
+    <rect x="645" y="440" width="330" height="118" rx="20" class="card-accent"/>
+    <text x="669" y="474" class="step">05  执行与仓位</text>
+    <text x="669" y="508" class="heading">同一信号，执行路径隔离</text>
+    <text x="669" y="538" class="body">模拟写纸面账本 · 实盘才向 QMT 委托</text>
+  </g>
+
+  <path d="M645 500H567" class="arrow"/>
+  <path d="M810 558V613" class="arrow"/>
+
+  <g filter="url(#shadow)">
+    <rect x="55" y="430" width="500" height="155" rx="20" class="card"/>
+    <text x="79" y="464" class="step">成交真实性</text>
+    <text x="79" y="500" class="heading">排板不是“下单即成交”</text>
+    <text x="79" y="532" class="body">新增累计成交手数 ≥ 前方队列手数 + 本单手数</text>
+    <text x="79" y="559" class="small">且确认时仍封板；撤单缩量、开板、跨日均不算成交</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="645" y="625" width="330" height="85" rx="20" class="card"/>
+    <text x="669" y="659" class="step">06  卖出与风险</text>
+    <text x="669" y="689" class="body">T+1 · 分档止盈 · 追踪止损 · 尾盘处理</text>
+  </g>
+
+  <path d="M975 668H1040" class="arrow"/>
+
+  <g filter="url(#shadow)">
+    <rect x="1052" y="625" width="173" height="85" rx="20" class="card"/>
+    <text x="1076" y="659" class="step">07  验证</text>
+    <text x="1076" y="689" class="body">Tick 回放 / A·B</text>
+  </g>
+</svg>
