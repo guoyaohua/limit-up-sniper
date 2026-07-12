@@ -283,6 +283,7 @@ python scripts/run_backtest.py --ticks output/tick_archive/20260710 `
 | [数据采集](docs/scraper.md) | 东方财富/同花顺数据抓取、反爬策略 |
 | [Level2 行情](docs/level2.md) | Level2 逐笔数据处理架构与实现 |
 | [基础设施](docs/infrastructure.md) | 进程管理、枚举定义、日志与邮件 |
+| [策略升级与验证计划](docs/strategy-upgrade-2026-07-12.md) | 本轮策略修复、盘前扩容、影子/回测闭环与 A/B 上线门槛 |
 | [迁移策略复盘](docs/strategy-review-2025-12-23_2026-01-12.md) | 旧项目 12 日报告聚合、保护清单与改进证据 |
 
 **推荐阅读顺序**：架构总览 → 交易流程 → 核心策略 → 配置参数
