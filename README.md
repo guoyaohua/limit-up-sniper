@@ -33,6 +33,7 @@
 - **自动邮件报表** — 每 5 分钟发送 HTML 市场状态报表，异常即时告警
 - **盘后智能复盘** — 自动计算每个过滤条件的精确率/召回率/F1，分析错过的机会
 - **影子信号模式** — 实盘运行同时并行虚拟回测，对比策略变体表现
+- **Tick 事件回测** — 下一笔行情成交、A 股成本/T+1/盘口容量、封板率与收益统一口径
 - **Level2 数据支持** — 共享内存环形缓冲区 + 逐笔数据处理，微秒级延迟
 
 ---
@@ -189,6 +190,22 @@ python main.py
 scripts\run_strategy.bat
 ```
 
+### 影子交易与 Tick 回测
+
+设置 `LIMIT_UP_ENABLE_SHADOW_SIGNAL=true` 后，实盘行情会同时驱动独立的持久化
+纸面账户；虚拟成交、持仓市值、浮动盈亏和净值曲线不会向 QMT 发送委托。
+
+```powershell
+# 在 QMT Python 环境保存可重放的完整 Tick/五档盘口
+python scripts/capture_ticks.py --verify
+
+# 使用策略插件回测；默认信号在下一笔该股票 Tick 成交，防止前视
+python scripts/run_backtest.py --ticks output/tick_archive/20260710 `
+  --strategy path/to/strategy.py --output output/backtests/20260710.json
+```
+
+归档、插件接口、成交假设和指标口径见 [Tick 回测与影子交易](docs/backtesting.md)。
+
 ---
 
 ## 交易日流程
@@ -259,6 +276,7 @@ scripts\run_strategy.bat
 | [配置参数手册](docs/configuration.md) | 所有参数详解与调优建议 |
 | [核心策略模块](docs/core-strategy.md) | 买入/卖出/撤单决策逻辑、涨停基因、止盈止损 |
 | [执行引擎](docs/engine.md) | Tick 处理、实盘下单、模拟交易、回调机制 |
+| [Tick 回测与影子交易](docs/backtesting.md) | Tick 归档、纸面撮合、回测插件与指标口径 |
 | [数据管理](docs/data-management.md) | 共享数据结构、序列化/备份、板块映射 |
 | [监控体系](docs/monitoring.md) | 板块监控、情绪评分、指标计算、邮件报表 |
 | [分析模块](docs/analysis.md) | 盘前 LLM 预测、盘后复盘、绩效分析 |
@@ -334,6 +352,9 @@ python -m pytest test/test_sector_monitor.py
 | `output/强势股票/` | 涨停基因 Top 1000 股票 CSV |
 | `output/涨停列表/` | 每日涨停/首板/炸板列表 |
 | `output/trade_logs/` | 交易日志 (JSON) |
+| `output/tick_archive/` | 按交易日分段的 gzip Tick 归档与完整性 manifest |
+| `output/paper_trading/` | 模拟/影子账户 SQLite 账本与净值曲线 |
+| `output/backtests/` | 回测 JSON 结果 |
 | `output/concept_sectors/` | 概念板块映射 |
 | `output/industry_sectors/` | 行业板块映射 |
 | `log/` | 分级日志文件 (DEBUG/INFO/WARNING/ERROR/CRITICAL) |
