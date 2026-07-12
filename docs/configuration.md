@@ -22,6 +22,15 @@
 | `LIMIT_UP_CLIENT_NAME` | `GJ_SIM` | 客户端：`GJ_SIM` 或 `CICC_LIVE` |
 | `LIMIT_UP_EXECUTION_MODE` | `simulation` | `simulation` 使用模拟执行器；`live` 发送真实委托 |
 | `LIMIT_UP_ENABLE_SHADOW_SIGNAL` | `false` | 是否并行运行影子策略 |
+| `LIMIT_UP_PAPER_INITIAL_CASH` | `1000000` | 纸面账户初始资金；未设置时影子账户代码默认 1000 万 |
+| `LIMIT_UP_PAPER_COMMISSION_RATE` | `0.0003` | 双边佣金率，小数表示 |
+| `LIMIT_UP_PAPER_MIN_COMMISSION` | `5` | 每笔最低佣金（元） |
+| `LIMIT_UP_PAPER_STAMP_DUTY_RATE` | `0.0005` | 卖出印花税率，小数表示 |
+| `LIMIT_UP_PAPER_TRANSFER_FEE_RATE` | `0.00001` | 双边过户费率，小数表示 |
+| `LIMIT_UP_PAPER_SLIPPAGE_BPS` | `2` | 纸面撮合滑点（基点） |
+| `LIMIT_UP_PAPER_PARTICIPATION_RATE` | `0.10` | 单笔最多占可见五档盘口的比例 |
+| `LIMIT_UP_PAPER_ALLOW_T0` | `false` | 是否允许当日买入当日卖出；正式验证应保持关闭 |
+| `LIMIT_UP_PAPER_DB` | `output/paper_trading` | SQLite 文件或目录；目录模式区分 simulation/shadow |
 | `GJ_SIM_QMT_CLIENT_PATH` | 空 | 模拟端 `userdata_mini` 路径 |
 | `GJ_SIM_STOCK_ACCOUNT` | 空 | 模拟资金账号 |
 | `CICC_QMT_CLIENT_PATH` | 空 | 实盘端 `userdata_mini` 路径 |
@@ -31,6 +40,8 @@
 
 路径或账号为空时，`main.py` 会在连接 QMT 前立即退出并提示缺少的变量。
 `live` 模式还会在启动时要求人工输入 `yes`。
+纸面费率均为小数，例如 `0.0003` 表示万分之三。默认撮合按五档盘口容量、
+100 股整手、滑点和 A 股 T+1 约束执行；排板还必须提供完整的队列成交证据。
 
 ---
 
@@ -222,6 +233,9 @@ LLM 优先板块折扣：优先板块内的股票，封单阈值额外 × 0.7。
 | `output/强势股票/` | 涨停基因 Top 1000 CSV |
 | `output/涨停列表/` | 每日涨停/首板/炸板列表 |
 | `output/trade_logs/{date}/` | 交易日志 JSON |
+| `output/tick_archive/{date}/` | 分段 Tick 归档、manifest 与 SHA-256 完整性信息 |
+| `output/paper_trading/` | 模拟与影子账户 SQLite 账本 |
+| `output/backtests/` | 事件回放与策略插件回测结果 JSON |
 | `output/concept_sectors/THS/` | 概念板块映射 JSON |
 | `output/industry_sectors/THS/` | 行业板块映射 JSON |
 | `log/` | 分级日志文件 |

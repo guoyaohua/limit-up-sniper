@@ -249,25 +249,40 @@ if order['委托类型'] == OrderType.CANCEL:
 
 ## 四、模拟交易器 (`simulator.py`)
 
-### 4.1 `run_xt_trader_simulator(order_queue, shared_data, shadow_signal_mode)`
+### 4.1 `run_xt_trader_simulator(order_queue, shared_data, shadow_signal_mode, market_queue)`
 
-**功能**：在不执行真实交易的情况下模拟交易执行，用于：
-- `DEBUG_MODE` 调试
-- 影子信号并行回测
+**功能**：用持久化 `PaperBroker` 消费策略委托和实时行情，不向 QMT 发送订单。
+`simulation` 模式承接主策略，`shadow` 模式使用独立的策略状态和纸面账户。
 
 **与实盘交易器的区别**：
 
-| 项目 | 实盘 | 模拟 |
-|------|------|------|
-| 资金 | 真实账户资金 | 虚拟资金（影子 1000 万/调试 3 万） |
-| 下单 | 调用 xt_trader.order_stock() | 直接更新 shared_data |
-| 成交 | 等待回报 | 根据排板/扫板模式模拟 |
-| 卖出 | 支持 | 抛出 NotImplementedError（暂未实现） |
+| 项目 | 实盘 | 模拟 / 影子 |
+|------|------|-------------|
+| 资金与持仓 | QMT 真实账户 | 独立虚拟现金、持仓和可用数量 |
+| 下单 | 调用 `xt_trader.order_stock()` | 由 `PaperBroker` 撮合，不调用交易接口 |
+| 成交依据 | 交易所回报 | 五档盘口、参与率、限价和保守排队证据 |
+| 卖出 | 交易所撮合 | 支持部分卖出，并默认执行 T+1 |
+| 账本 | 券商账户 | SQLite；每次成交持久化，约每 5 秒记录净值 |
 
-**三种买入模拟模式**：
-1. **模拟成交**：直接将订单标记为已成交，更新持仓状态
-2. **排板模拟**：记录下单时的封单量和成交量，等待 `check_order_successed()` 判断
-3. **扫板模拟**：直接标记为成交（假设扫板即成交）
+纸面账户默认初始资金为 100 万元；未设置 `LIMIT_UP_PAPER_INITIAL_CASH` 时，
+独立影子账户默认使用 1000 万元。路径默认为
+`output/paper_trading/simulation.sqlite3` 和 `shadow.sqlite3`。同一 `signal_id`
+在进程重启后不会重复记账。
+
+### 4.2 成交、费用与持仓规则
+
+- 普通买入和卖出按可成交的五档盘口计算 VWAP，再加入配置滑点；
+- 成交数量为 100 股的整数倍，且不超过可见盘口乘以参与率；
+- 限价买单不会高于委托价成交，限价卖单不会低于委托价成交；
+- 排板订单只有在仍封板且累计成交穿透“前方队列 + 本单”时才整单成交；
+- 开板、封单减少或不完整的旧委托都不能单独证明排板成交；
+- 默认 T+1，当日买入数量冻结至下一交易日；
+- 买卖均收取佣金和过户费，卖出额外收取印花税；
+- 实时 Tick 更新持仓市值、浮动盈亏和账户净值，结果同步回 `shared_data`。
+
+成交假设通过 `LIMIT_UP_PAPER_*` 环境变量配置，完整清单见
+[配置参数手册](configuration.md)；离线回测沿用相同的 `PaperBroker` 规则，见
+[Tick 回测与影子交易](backtesting.md)。
 
 ---
 
