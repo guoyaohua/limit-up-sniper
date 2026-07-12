@@ -309,9 +309,24 @@ def get_strong_stocks(stock_pool, stock_info_dict, end_date):
         # ---------------------------------- 载入本地文件 ---------------------------------- #
         output_path = os.path.join('output', '强势股票', f'强势股票_{TODAY}.csv')
         if os.path.exists(output_path):
-            strong_stock_df = pd.read_csv(output_path)
-            logger.info(f'日期：{TODAY}，强势股票数据已存在，直接加载 {output_path}')
-            return strong_stock_df["股票代码"].unique().tolist()
+            strong_stock_df = pd.read_csv(
+                output_path, dtype={'股票代码': str})
+            if "股票代码" not in strong_stock_df.columns:
+                raise ValueError(f'强势股票缓存缺少股票代码列: {output_path}')
+            cached_codes = [
+                str(code) for code in strong_stock_df["股票代码"].dropna()
+            ]
+            valid_pool = set(stock_pool)
+            unknown = sorted(set(cached_codes) - valid_pool)
+            if unknown:
+                logger.warning(
+                    f'日期：{TODAY}，强势股票缓存与当前股票池不一致，'
+                    f'忽略缓存并重新计算；异常代码数：{len(unknown)}')
+            else:
+                logger.info(
+                    f'日期：{TODAY}，强势股票数据已存在且通过股票池校验，'
+                    f'直接加载 {output_path}')
+                return list(dict.fromkeys(cached_codes))
     except Exception as e:
         logger.exception(f'【关键错误】获取强势股票初始化失败: {e}')
         send_email('【关键错误】获取强势股票初始化失败',

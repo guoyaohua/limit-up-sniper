@@ -12,6 +12,7 @@ import pytest
 
 from analysis import pre_market_analysis
 from core import decisions
+from core import gene_calculator
 from engine import tick_processor
 from core.gene_calculator import (
     STRENGTH_SCORE_WEIGHTS,
@@ -32,6 +33,20 @@ class _HotStock:
         self.change_percent = 1.23
         self.concept_tags = concepts or []
         self.popularity_tag = '持续上榜'
+
+
+def test_strong_stock_cache_preserves_codes_and_requires_current_pool(
+        monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    cache_dir = tmp_path / 'output' / '强势股票'
+    cache_dir.mkdir(parents=True)
+    pd.DataFrame({'股票代码': ['000001.SZ', '600000.SH']}).to_csv(
+        cache_dir / f'强势股票_{gene_calculator.TODAY}.csv', index=False)
+
+    codes = gene_calculator.get_strong_stocks(
+        ['000001.SZ', '600000.SH'], {}, '20260710')
+
+    assert codes == ['000001.SZ', '600000.SH']
 
 
 def _strength_frame():
