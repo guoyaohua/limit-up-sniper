@@ -1,11 +1,13 @@
 """Offline regression tests for deterministic strategy rules."""
 
 import json
+import subprocess
 import sys
 import time
 import types
 from datetime import datetime as RealDatetime
 from multiprocessing import Array, Value
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -225,6 +227,33 @@ def test_tick_dispatch_keeps_each_stock_on_one_fifo_partition():
             if stock_code in payload
         ]
         assert stock_times == [1, 2]
+
+
+def test_tick_processor_imports_without_proprietary_qmt_sdk():
+    """Exercise the same import path as GitHub Actions without XTQuant."""
+    script = """
+import importlib.abc
+import sys
+
+class BlockXtquant(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'xtquant' or fullname.startswith('xtquant.'):
+            raise ModuleNotFoundError('blocked XTQuant SDK', name=fullname)
+        return None
+
+sys.meta_path.insert(0, BlockXtquant())
+from engine import tick_processor
+assert tick_processor.xtconstant.STOCK_BUY == 23
+"""
+    completed = subprocess.run(
+        [sys.executable, '-c', script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_pre_market_result_is_bounded_and_tolerates_bad_model_output():

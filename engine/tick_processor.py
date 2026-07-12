@@ -14,7 +14,6 @@ from functools import partial
 from multiprocessing import current_process, Value
 from datetime import datetime, time as dt_time
 from loguru import logger
-from xtquant import xtconstant
 
 from config import (
     STOP_TIME, STRATEGY_NAME, DEBUG_MODE,
@@ -23,6 +22,7 @@ from config import (
     MAX_CANCEL_COUNT,
     WATCHLIST_RELEASE_MINUTES, WATCHLIST_RELEASE_TURNOVER,
 )
+from infra.xtconstant_compat import xtconstant
 from infra.common_enums import (
     OrderType, StockOrderStatusInt, StockLimitStatusInt,
 )
