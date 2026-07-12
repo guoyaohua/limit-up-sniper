@@ -197,7 +197,7 @@ def _get_yesterday_limit_up_stocks() -> str:
         return '数据获取失败'
 
 
-def _get_first_board_candidate_pool() -> list[dict]:
+def _get_first_board_candidate_pool(yesterday_limit_up_codes=None) -> list[dict]:
     """Load a broad, ranked pool for first-board discovery.
 
     The strong-stock file has already applied liquidity and historical-gene
@@ -216,11 +216,15 @@ def _get_first_board_candidate_pool() -> list[dict]:
         if '涨停基因打分' in df.columns:
             df = df.sort_values('涨停基因打分', ascending=False)
 
+        excluded = {
+            _normalise_stock_code(code)
+            for code in (yesterday_limit_up_codes or ())
+            if _normalise_stock_code(code)
+        }
         candidates = []
-        for rank, (_, row) in enumerate(
-                df.head(FIRST_BOARD_POOL_LIMIT).iterrows(), 1):
+        for rank, (_, row) in enumerate(df.iterrows(), 1):
             code = _normalise_stock_code(row.get('股票代码'))
-            if not code:
+            if not code or code in excluded:
                 continue
             candidates.append({
                 'code': code,
@@ -231,10 +235,23 @@ def _get_first_board_candidate_pool() -> list[dict]:
                 'next_day_red_rate': _finite_float(
                     row.get('首板次日收盘红盘率')),
             })
+            if len(candidates) >= FIRST_BOARD_POOL_LIMIT:
+                break
         return candidates
     except Exception as exc:
         logger.error(f'获取盘前首板候选池失败: {exc}')
         return []
+
+
+def _extract_stock_codes(text: str) -> set[str]:
+    """Extract locally supplied six-digit codes from a prompt data block."""
+    codes = set()
+    normalized = str(text or "").replace("(", " ").replace(")", " ")
+    for token in normalized.split():
+        code = _normalise_stock_code(token)
+        if code:
+            codes.add(code)
+    return codes
 
 
 def _finite_float(value) -> float | None:
@@ -245,9 +262,16 @@ def _finite_float(value) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _build_candidate_evidence(ths_data: dict,
-                              gene_candidates: list[dict]) -> tuple[str, dict[str, set[str]], set[str]]:
+def _build_candidate_evidence(
+        ths_data: dict,
+        gene_candidates: list[dict],
+        excluded_codes=None) -> tuple[str, dict[str, set[str]], set[str]]:
     """Merge independent discovery sources and describe their evidence."""
+    excluded = {
+        _normalise_stock_code(code)
+        for code in (excluded_codes or ())
+        if _normalise_stock_code(code)
+    }
     evidence = defaultdict(lambda: {
         'name': '', 'sources': set(), 'concepts': set(), 'ranks': {},
         'gene_score': None, 'seal_rate': None, 'next_day_red_rate': None,
@@ -257,7 +281,7 @@ def _build_candidate_evidence(ths_data: dict,
                                  ('hot_24h', 'hot_stocks_24h_raw')):
         for fallback_rank, stock in enumerate(ths_data.get(data_key, []), 1):
             code = _normalise_stock_code(getattr(stock, 'code', ''))
-            if not code:
+            if not code or code in excluded:
                 continue
             item = evidence[code]
             item['name'] = getattr(stock, 'name', '') or item['name']
@@ -271,6 +295,8 @@ def _build_candidate_evidence(ths_data: dict,
 
     for candidate in gene_candidates:
         code = candidate['code']
+        if code in excluded:
+            continue
         item = evidence[code]
         item['name'] = candidate.get('name') or item['name']
         item['sources'].add('gene_pool')
@@ -603,9 +629,10 @@ def run_pre_market_analysis() -> dict:
         # 2. 获取数据
         ths_data = _fetch_ths_data()
         yesterday_limit_up = _get_yesterday_limit_up_stocks()
-        gene_candidates = _get_first_board_candidate_pool()
+        yesterday_codes = _extract_stock_codes(yesterday_limit_up)
+        gene_candidates = _get_first_board_candidate_pool(yesterday_codes)
         candidate_evidence, evidence_sources, sector_names = _build_candidate_evidence(
-            ths_data, gene_candidates)
+            ths_data, gene_candidates, yesterday_codes)
 
         # 3. 填充 Prompt
         prompt = template.format(

@@ -379,6 +379,22 @@ def test_pre_market_candidate_pool_is_ranked_and_broad(monkeypatch, tmp_path):
     assert pool[0]['seal_rate'] == pytest.approx(0.9)
 
 
+def test_pre_market_candidate_pool_excludes_yesterday_limit_ups(
+        monkeypatch, tmp_path):
+    strong_dir = tmp_path / 'output' / '强势股票'
+    strong_dir.mkdir(parents=True)
+    pd.DataFrame({
+        '股票代码': ['000001', '600000'],
+        '股票名称': ['昨日已板', '今日候选'],
+        '涨停基因打分': [99.0, 90.0],
+    }).to_csv(strong_dir / '强势股票_20260710.csv', index=False)
+    monkeypatch.setattr(pre_market_analysis, 'ROOT_DIR', str(tmp_path))
+
+    pool = pre_market_analysis._get_first_board_candidate_pool({'000001'})
+
+    assert [item['code'] for item in pool] == ['600000']
+
+
 def test_candidate_evidence_merges_hot_lists_and_gene_pool():
     text, sources, sectors = pre_market_analysis._build_candidate_evidence(
         {
@@ -403,6 +419,23 @@ def test_candidate_evidence_merges_hot_lists_and_gene_pool():
     assert sources['600000'] == {'24小时热榜'}
     assert {'AI', '机器人', '银行'} <= sectors
     assert '历史首板封板率=85.0%' in text
+
+
+def test_candidate_evidence_excludes_yesterday_boards_from_every_source():
+    text, sources, _ = pre_market_analysis._build_candidate_evidence(
+        {
+            'hot_stocks_1h_raw': [_HotStock('000001', 1, ['AI'])],
+            'hot_stocks_24h_raw': [_HotStock('600000', 2, ['银行'])],
+            'hot_concept_sectors_raw': [],
+            'hot_industry_sectors_raw': [],
+        },
+        [{'code': '000001', 'name': '昨日已板', 'rank': 1}],
+        {'000001'},
+    )
+
+    assert '000001' not in text
+    assert '000001' not in sources
+    assert '600000' in sources
 
 
 def test_exploration_candidates_are_local_market_codes_only():
