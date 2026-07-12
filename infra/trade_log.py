@@ -80,6 +80,8 @@ def record_strategy_event(shared_data: dict,
         'timestamp': timestamp_now,
         'stock_code': stock_code,
     }
+    if shared_data:
+        event_record['signal_source'] = shared_data.get('信号来源', 'primary')
     if stock_name:
         event_record['stock_name'] = stock_name
     if reason:

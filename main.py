@@ -186,6 +186,9 @@ def main():
                                    strong_stocks,
                                    PRE_TRADE_DATE,
                                    new_stock_list=new_stock_list)
+    # Restored backups predate source-labelled event logs.  Always repair the
+    # lane in memory so primary and shadow decisions cannot share an identity.
+    shared_data['信号来源'] = 'primary'
 
     # U7升级：盘前 LLM 板块预判
     sector_priority = {}
@@ -264,6 +267,7 @@ def main():
                                               shadow_signal_mode=True,
                                               base_shared_data=shared_data,
                                               new_stock_list=new_stock_list)
+        shadow_shared_data['信号来源'] = 'shadow'
 
         shadow_process_count = SHADOW_TICK_PROCESSOR_COUNT
         logger.info(f'[影子模式] 注册 {shadow_process_count} 个Tick数据处理进程...')

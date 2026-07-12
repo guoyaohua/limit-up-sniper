@@ -165,6 +165,7 @@ def init_shared_data(stock_pool,
 
                 # 创建共享数据字典
                 shared_data = {
+                    '信号来源': 'primary',
                     '股票信息': stock_info_dict,  # 股票信息字典
                     '持仓状态': manager_proxies['持仓状态'],  # 股票代码 -> 持仓状态字典JSON string
                     '委托状态': manager_proxies['委托状态'],  # 委托状态(可撤委托)，股票代码 -> 委托状态
@@ -307,6 +308,7 @@ def init_shared_data(stock_pool,
                 logger.info(f"[影子模式] Manager 代理对象创建完成，耗时 {time.time() - shadow_mgr_start:.2f}s")
 
                 shared_data = {
+                    '信号来源': 'shadow',
                     '股票信息': stock_info_dict,  # 股票信息字典
                     '持仓状态': shadow_manager_proxies['持仓状态'],  # 股票代码 -> 持仓状态字典JSON string
                     '委托状态': shadow_manager_proxies['委托状态'],  # 委托状态(可撤委托)，股票代码 -> 委托状态
