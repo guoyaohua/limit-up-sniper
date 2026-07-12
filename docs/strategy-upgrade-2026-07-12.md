@@ -205,7 +205,7 @@ gzip JSONL 分段，保留原始五档数组、事件时间、接收时间、回
 | 投资逻辑合理 | 通过：扩大的是发现层，不是买入权限；原风控保护保持 |
 | 核心目标对齐 | 通过：风控优先，其次封板/胜率、盈亏比、无效交易和合理频率 |
 
-本机 QMT 环境与不安装 XTQuant 的纯净 Python 3.11 环境均为 `90 passed`；
+本机 QMT 环境与不安装 XTQuant 的纯净 Python 3.11 环境均为 `101 passed`；
 GitHub Actions 离线测试、gitleaks 和本地 `git diff --check` 均通过。
 
 ## 八、已知限制与下一步
