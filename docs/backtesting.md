@@ -97,6 +97,8 @@ python scripts/run_backtest.py `
 
 结果 JSON 包括成交、未平仓、FIFO 已平交易、净值曲线和：总收益、最大回撤、
 胜率、盈亏比、费用、逐观测 Sharpe、成交数，以及打板专用指标。
+胜率和收盘封板率同时给出 Wilson 95% 置信区间；样本数为 0 时点估计与区间均为
+`null`，避免把“没有交易”误读成 0% 胜率。
 
 `limit_up_entry=True` 表示该信号属于打板入场。封板定义为买一价等于最新价、卖一
 为空；若 Tick 提供 `limitUpPrice`/`upperLimitPrice`，还要求买一等于涨停价。

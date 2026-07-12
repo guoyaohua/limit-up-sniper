@@ -8,6 +8,7 @@ keeps execution assumptions identical between research and live shadow accounts.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -67,6 +68,41 @@ def _maximum_drawdown(values: list[float]) -> float:
         if peak > 0:
             maximum = max(maximum, (peak - value) / peak)
     return maximum
+
+
+def wilson_interval(
+    successes: int, total: int, *, z: float = 1.959963984540054
+) -> dict[str, float | int] | None:
+    """Return a two-sided Wilson score interval for a binomial proportion.
+
+    ``None`` deliberately represents an unavailable estimate: a 0% point
+    estimate with no observations is not evidence of a 0% success rate.
+    """
+    if total < 0 or successes < 0 or successes > total:
+        raise ValueError("successes and total must satisfy 0 <= successes <= total")
+    if not math.isfinite(z) or z <= 0:
+        raise ValueError("z must be a positive finite number")
+    if total == 0:
+        return None
+    proportion = successes / total
+    z_squared = z * z
+    denominator = 1 + z_squared / total
+    centre = (proportion + z_squared / (2 * total)) / denominator
+    margin = (
+        z
+        * math.sqrt(
+            proportion * (1 - proportion) / total
+            + z_squared / (4 * total * total)
+        )
+        / denominator
+    )
+    return {
+        "successes": successes,
+        "total": total,
+        "confidence_level": 0.95,
+        "lower": round(max(0.0, centre - margin), 8),
+        "upper": round(min(1.0, centre + margin), 8),
+    }
 
 
 def _is_limit_up_tick(tick: Mapping[str, Any]) -> bool:
@@ -132,6 +168,12 @@ def calculate_performance(
     sealed_at_least_once = sum(bool(entry["ever_sealed"]) for entry in entries)
     sealed_through_close = sum(bool(entry["sealed_at_close"]) for entry in entries)
     broken_after_seal = sum(bool(entry["broken_after_seal"]) for entry in entries)
+    win_rate = round(len(winners) / len(closed), 8) if closed else None
+    seal_success_rate = (
+        round(sealed_through_close / limit_up_entries, 8)
+        if limit_up_entries
+        else None
+    )
     return {
         "initial_cash": broker.config.initial_cash,
         "final_equity": final_snapshot["equity"],
@@ -142,7 +184,8 @@ def calculate_performance(
         "closed_trade_count": len(closed),
         "win_count": len(winners),
         "loss_count": len(losers),
-        "win_rate": round(len(winners) / len(closed), 8) if closed else 0.0,
+        "win_rate": win_rate,
+        "win_rate_wilson_95": wilson_interval(len(winners), len(closed)),
         "average_trade_return": round(
             mean(trade["return"] for trade in closed), 8
         )
@@ -161,10 +204,9 @@ def calculate_performance(
         "sealed_at_least_once_count": sealed_at_least_once,
         "sealed_through_close_count": sealed_through_close,
         "broken_after_seal_count": broken_after_seal,
-        "seal_success_rate": (
-            round(sealed_through_close / limit_up_entries, 8)
-            if limit_up_entries
-            else None
+        "seal_success_rate": seal_success_rate,
+        "seal_success_rate_wilson_95": wilson_interval(
+            sealed_through_close, limit_up_entries
         ),
     }
 

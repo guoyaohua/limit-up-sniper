@@ -3,7 +3,12 @@ from pathlib import Path
 import pytest
 
 from data.tick_archive import TickArchiveWriter
-from engine.backtest import BacktestConfig, BacktestEngine, BacktestSignal
+from engine.backtest import (
+    BacktestConfig,
+    BacktestEngine,
+    BacktestSignal,
+    wilson_interval,
+)
 from engine.paper_broker import BrokerConfig
 
 
@@ -44,6 +49,28 @@ def _broker_config() -> BrokerConfig:
         participation_rate=1,
         allow_t0=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("successes", "total", "expected"),
+    [
+        (0, 0, None),
+        (0, 1, (0.0, 0.79345069)),
+        (1, 1, (0.20654931, 1.0)),
+        (0, 10, (0.0, 0.2775328)),
+        (10, 10, (0.7224672, 1.0)),
+        (50, 100, (0.40383153, 0.59616847)),
+    ],
+)
+def test_wilson_interval_boundaries(successes, total, expected):
+    interval = wilson_interval(successes, total)
+    if expected is None:
+        assert interval is None
+        return
+    assert interval["lower"] == pytest.approx(expected[0])
+    assert interval["upper"] == pytest.approx(expected[1])
+    assert interval["successes"] == successes
+    assert interval["total"] == total
 
 
 def test_signal_executes_on_next_stock_tick_without_lookahead(tmp_path: Path):
