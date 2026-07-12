@@ -51,6 +51,42 @@ def test_strong_stock_cache_preserves_codes_and_requires_current_pool(
     assert codes == ['000001.SZ', '600000.SH']
 
 
+def test_strong_stock_cache_loads_without_proprietary_qmt_sdk(
+        monkeypatch, tmp_path):
+    """A valid local cache must not require XTQuant to be importable."""
+    monkeypatch.chdir(tmp_path)
+    cache_dir = tmp_path / 'output' / '强势股票'
+    cache_dir.mkdir(parents=True)
+    pd.DataFrame({'股票代码': ['000001.SZ']}).to_csv(
+        cache_dir / f'强势股票_{gene_calculator.TODAY}.csv', index=False)
+
+    script = f"""
+import importlib.abc
+import os
+import sys
+
+class BlockXtquant(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'xtquant' or fullname.startswith('xtquant.'):
+            raise ModuleNotFoundError('blocked XTQuant SDK', name=fullname)
+        return None
+
+sys.meta_path.insert(0, BlockXtquant())
+sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
+os.chdir({str(tmp_path)!r})
+from core.gene_calculator import get_strong_stocks
+assert get_strong_stocks(['000001.SZ'], {{}}, '20260710') == ['000001.SZ']
+"""
+    completed = subprocess.run(
+        [sys.executable, '-c', script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def _strength_frame():
     data = {'股票代码': ['LOW', 'MID', 'HIGH']}
     for factor in STRENGTH_SCORE_WEIGHTS:

@@ -303,9 +303,6 @@ def calculate_strength_scores(result_df: pd.DataFrame) -> pd.DataFrame:
 
 def get_strong_stocks(stock_pool, stock_info_dict, end_date):
     try:
-        from xtquant import xtdata
-        from joblib import Parallel, delayed
-
         # ---------------------------------- 载入本地文件 ---------------------------------- #
         output_path = os.path.join('output', '强势股票', f'强势股票_{TODAY}.csv')
         if os.path.exists(output_path):
@@ -334,6 +331,16 @@ def get_strong_stocks(stock_pool, stock_info_dict, end_date):
         raise e
 
     # ---------------------------------- 获取K线数据 ---------------------------------- #
+    # A valid cache is intentionally usable without the proprietary QMT SDK.
+    # Only a cache miss or a stale cache needs live XTQuant market data.
+    try:
+        from xtquant import xtdata
+        from joblib import Parallel, delayed
+    except ImportError as exc:
+        raise RuntimeError(
+            '未找到可用的强势股票缓存，重新计算需要安装 QMT/XTQuant SDK'
+        ) from exc
+
     k_line = xtdata.get_market_data(field_list=[
         'time', 'open', 'high', 'low', 'close', 'volume', 'amount', 'preClose',
         'suspendFlag'
