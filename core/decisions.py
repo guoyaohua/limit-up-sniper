@@ -729,10 +729,14 @@ def should_cancel(shared_data,
         #                                     撤买判断                                  #
         # ---------------------------------------------------------------------------- #
         if cancel_buy:
-            # -------------- 1. 判断是否为涨停状态，如果否则证明打板均已成交，跳过撤单判断 (理论上不会进入这个逻辑) -------------- #
+            # 开板不能证明排队成交。模拟/影子订单仍保留在委托状态时，
+            # 应立即撤单，避免后续回封时把已经失效的排队位置继续沿用。
             if not is_limit_up:
-                logger.error(f'{stock_code} {stock_name} 非涨停状态，无法撤单，跳过撤单判断')
-                return False
+                msg = f'{stock_code} {stock_name} 涨停已打开且排板未确认成交，撤单'
+                logger.warning(msg)
+                order.clear()
+                order.update({'操作原因': msg})
+                return True
 
             # 缓存常用值
             with stock_status['封单金额'].get_lock():

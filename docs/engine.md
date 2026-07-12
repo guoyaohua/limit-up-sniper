@@ -116,7 +116,9 @@ if lastPrice > current_highest and stock_code in 持仓:
 
 仅在 `DEBUG_MODE` 或影子信号模式下：
 - 调用 `check_order_successed()` 检查排板订单是否可能已成交
-- 成交判断逻辑：对比下单时的成交量和封单量与当前值
+- 只用下单后的累计成交量消耗排队位置，封单减少可能来自撤单，不作为成交证据
+- 必须满足“新增成交手数 ≥ 前方队列手数 + 本单手数”才确认整单成交
+- 开板本身、旧委托缺少队列快照或行情字段异常时均保持未成交
 
 #### Step 5: 决策触发
 
@@ -136,11 +138,11 @@ if should_sell(shared_data, stock_code, tick_data, ...):
 **功能**：在模拟环境中判断排板买单是否已成交。
 
 **判断逻辑**：
-1. 如果股票已开板（不在涨停）→ 认为成交
-2. 如果仍在涨停：
-   - 计算成交量变化：`volume_diff = current_volume - order_time_volume`
-   - 计算封单量变化：`closing_vol_diff = order_time_bid_vol - current_bid_vol`
-   - 如果 `volume_diff ≥ order_time_closing_vol` → 认为排队到了，成交
+1. 下单时保存累计成交手数、前方买一队列手数和本单手数。
+2. 后续仅计算 `traded_lots = current_volume - submitted_volume`。
+3. 只有股票仍封板且 `traded_lots ≥ queue_ahead_lots + order_lots` 时确认整单成交。
+4. 买一封单减少不计入成交量，避免把其他订单撤单误判为本单成交。
+5. 开板不自动确认成交；无法取得完整、合法的队列证据时按未成交处理。
 
 ### 2.4 `create_whole_quote_task(stock_pool, stock_info_dict, tick_queue, shadow_tick_queue)`
 

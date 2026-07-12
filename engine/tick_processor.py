@@ -5,6 +5,7 @@ engine/tick_processor.py - Tick 数据处理与全推行情订阅
 check_order_successed 模拟成交判断、create_whole_quote_task 订阅任务。
 """
 
+import json
 import time
 import traceback
 import zlib
@@ -37,6 +38,7 @@ from core.decisions import (
 )
 from core.trailing_stop import calculate_trailing_stop_prices
 from infra.trade_log import record_strategy_event
+from engine.queue_fill import queued_buy_fill_progress
 
 
 # 全局回调心跳监控器（用于监控 xtdata 回调是否正常）
@@ -198,7 +200,14 @@ def check_order_successed(shared_data,
                           strong_stocks=None,
                           order_status=None,
                           stock_status=None):
-    """检查是否成交"""
+    """Conservatively confirm a queued limit-up buy.
+
+    XTQuant's cumulative ``volume`` and level-one ``bidVol`` are both in lots.
+    A falling bid queue is not execution evidence because cancellations are
+    indistinguishable from trades in a snapshot.  Therefore an order is only
+    considered filled while the stock is still sealed and cumulative trades
+    since submission cover both the queue ahead and our complete order.
+    """
     # 性能优化：使用缓存的数据引用
     if strong_stocks is None:
         strong_stocks = shared_data['强势股票']
@@ -213,34 +222,44 @@ def check_order_successed(shared_data,
     if stock_code not in order_status.keys():
         return False
 
+    try:
+        encoded_orders = order_status[stock_code]
+        orders = (json.loads(encoded_orders)
+                  if isinstance(encoded_orders, str) else encoded_orders)
+        pending_order = orders[0]
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        # Restored legacy orders do not have an auditable queue snapshot.  Fail
+        # closed rather than manufacturing a profitable fill.
+        logger.warning(f'[模拟] {stock_code} 排板委托缺少完整队列快照，保持未成交')
+        return False
+
     if not is_limit_up:
-        # 如果开板则认为成交
-        logger.warning(f'[模拟] {stock_code} 开板状态，认为成交')
+        # Once the board opens, the original queue position is no longer
+        # auditable.  Persist the invalidation before should_cancel() enqueues
+        # its asynchronous cancel so a fast reseal cannot resurrect the order.
+        pending_order["排队已失效"] = True
+        pending_order["排队失效原因"] = "limit-up opened before confirmed fill"
+        try:
+            order_status[stock_code] = json.dumps(orders, ensure_ascii=False)
+        except (TypeError, ValueError):
+            logger.warning(f'[模拟] {stock_code} 无法持久化排队失效状态')
+        logger.info(f'[模拟] {stock_code} 已开板；排队位置作废并保持未成交')
+        return False
+
+    progress = queued_buy_fill_progress(
+        pending_order, tick_data, is_limit_up=is_limit_up
+    )
+    if progress.confirmed:
+        logger.warning(
+            f'[模拟] {stock_code} 排队成交证据充分：新增成交 '
+            f'{progress.traded_lots:g} 手 >= 所需 {progress.required_lots:g} 手'
+        )
         return True
 
-    with stock_status['下单时成交量'].get_lock():
-        volume_diff = tick_data['volume'] - stock_status['下单时成交量'].value
-
-    with stock_status['下单时封单量'].get_lock():
-        bid_vol = stock_status['下单时封单量'].value
-        bid_vol_diff = bid_vol - tick_data['bidVol'][0]
-
-    if bid_vol_diff < 0:
-        if volume_diff >= bid_vol:
-            # 封板量增加, 且成交量增加大于等于封板量，认为成交
-            logger.warning(
-                f'[模拟] {stock_code} 封板量增加, 且成交量增加 {volume_diff} >= 下单时封单量 {bid_vol}，认为成交'
-            )
-            return True
-    else:
-        if volume_diff + bid_vol_diff >= bid_vol:
-            # 封板量减少, 且成交量增加加上封板量减少大于等于封板量，认为成交 （不准确，只能大概）
-            logger.warning(
-                f'[模拟] {stock_code} 封板量减少, 且成交量增加 {volume_diff} + 封单量减少 {bid_vol_diff} >= 下单时封单量 {bid_vol}，认为成交'
-            )
-            return True
-
-    logger.info(f'[模拟] {stock_code} 目前未成交')
+    logger.info(
+        f'[模拟] {stock_code} 排队未成交：新增成交 {progress.traded_lots:g} 手 '
+        f'< 所需 {progress.required_lots:g} 手（{progress.reason}；封单减少不计成交）'
+    )
 
     return False
 

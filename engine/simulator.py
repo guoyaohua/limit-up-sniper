@@ -26,6 +26,7 @@ from config import (
     WATCHLIST_POSITION_RATIO,
 )
 from engine.paper_broker import BrokerConfig, Fill, PaperBroker
+from engine.queue_fill import queued_buy_fill_progress
 from infra.common_enums import OrderType, StockOrderStatusInt
 
 
@@ -206,6 +207,13 @@ def execute_paper_order(
             return None
         pending.pop(stock_code, None)
         _set_status(shared_data, stock_code, StockOrderStatusInt.CANCELLED)
+        cancel_count = shared_data.get("撤单次数")
+        if cancel_count is not None:
+            if hasattr(cancel_count, "get_lock"):
+                with cancel_count.get_lock():
+                    cancel_count.value += 1
+            elif hasattr(cancel_count, "value"):
+                cancel_count.value += 1
         return None
 
     if order_type == OrderType.BUY and order_req.get("买入类型") == "排板":
@@ -219,13 +227,20 @@ def execute_paper_order(
         pending[stock_code] = json.dumps(
             [
                 {
-                    "委托类型": OrderType.BUY.value,
+                    # Match the real-trader order schema so should_cancel() can
+                    # identify this as a cancellable buy order.
+                    "委托类型": OrderType.买入.value,
                     "证券代码": stock_code,
                     "委托价格": float(order_req["委托价格"]),
                     "委托数量": quantity,
                     "订单编号": f"paper_pending_{stock_code}_{_event_suffix(tick)}",
                     "操作原因": reason,
                     "signal_id": signal_id,
+                    # XTQuant quote volumes are lots.  These immutable fields
+                    # are the only evidence accepted by the queue fill model.
+                    "下单累计成交手数": float(tick.get("volume", 0) or 0),
+                    "前方队列手数": float((tick.get("bidVol") or [0])[0] or 0),
+                    "本单手数": quantity / broker.config.lot_size,
                 }
             ],
             ensure_ascii=False,
@@ -233,8 +248,8 @@ def execute_paper_order(
         status = shared_data["股票状态信号"][stock_code]
         if tick:
             for key, value in (
-                ("下单时成交量", float(tick.get("volume", 0) or 0)),
-                ("下单时封单量", float((tick.get("bidVol") or [0])[0] or 0)),
+                ("下单时成交量", int(tick.get("volume", 0) or 0)),
+                ("下单时封单量", int((tick.get("bidVol") or [0])[0] or 0)),
             ):
                 target = status.get(key)
                 if target is not None:
@@ -244,6 +259,7 @@ def execute_paper_order(
         return None
 
     if order_type == OrderType.BUY:
+        execution_tick = tick
         if order_req.get("买入类型") == "模拟成交":
             encoded = pending.get(stock_code)
             if not encoded:
@@ -253,6 +269,38 @@ def execute_paper_order(
             limit_price = float(pending_order["委托价格"])
             reason = str(pending_order.get("操作原因", reason))
             signal_id = str(pending_order.get("signal_id", signal_id))
+            last_price = float(tick.get("lastPrice", 0) or 0)
+            bid_prices = tick.get("bidPrice") or []
+            ask_prices = tick.get("askPrice") or []
+            bid_price = float(bid_prices[0] or 0) if bid_prices else 0.0
+            ask_price = float(ask_prices[0] or 0) if ask_prices else 0.0
+            # A queue fill must still be observed on a sealed limit-up book.
+            # Merely trading at the limit price after the ask queue reappears
+            # is an opened board and cannot prove our bid was reached.
+            is_limit_up = (
+                limit_price > 0
+                and abs(last_price - limit_price) < 0.0001
+                and abs(bid_price - limit_price) < 0.0001
+                and ask_price <= 0
+            )
+            progress = queued_buy_fill_progress(
+                pending_order, tick, is_limit_up=is_limit_up
+            )
+            if not progress.confirmed:
+                logger.warning(
+                    f"[模拟] 拒绝无充分排队证据的成交 {stock_code}: "
+                    f"{progress.reason}"
+                )
+                return None
+            # Queue evidence has already established a full fill at the daily
+            # limit.  Do not let a sparse/stale ask snapshot grant an impossible
+            # price improvement below the original limit order.
+            execution_tick = dict(tick)
+            execution_tick["lastPrice"] = limit_price
+            execution_tick["askPrice"] = [limit_price]
+            execution_tick["askVol"] = [
+                quantity / broker.config.lot_size
+            ]
             respect_liquidity = False
         else:
             quantity = _requested_buy_quantity(
@@ -263,7 +311,7 @@ def execute_paper_order(
         fill = broker.buy(
             stock_code,
             quantity,
-            tick,
+            execution_tick,
             limit_price=limit_price,
             reason=reason,
             signal_id=signal_id,
