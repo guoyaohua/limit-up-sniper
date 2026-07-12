@@ -64,6 +64,21 @@ def init_shared_data(stock_pool,
             if restored_shared_data:
                 logger.info("成功从备份文件恢复shared_data")
                 shared_data = restored_shared_data
+                # 实时派生数据不能跨进程重启直接复用。监控任务会重新填充
+                # 内容和时间戳；在此之前买入逻辑保持 fail-closed。
+                for realtime_key in (
+                        '概念板块效应', '行业板块效应', '个股资金流入'):
+                    realtime_data = shared_data.get(realtime_key)
+                    if realtime_data is not None:
+                        realtime_data.clear()
+                for timestamp_key in (
+                        '概念板块更新时间', '行业板块更新时间',
+                        '个股资金流入更新时间'):
+                    timestamp_obj = shared_data.get(timestamp_key)
+                    if timestamp_obj is not None and hasattr(timestamp_obj,
+                                                              'get_lock'):
+                        with timestamp_obj.get_lock():
+                            timestamp_obj.value = 0.0
                 print_data_summary(shared_data)
             else:
                 logger.info("未找到备份文件，创建新的shared_data")
@@ -305,10 +320,16 @@ def init_shared_data(stock_pool,
                     '昨日涨停股票': base_shared_data['昨日涨停股票'],  # 昨日涨停股票列表
                     '概念板块效应':
                     base_shared_data['概念板块效应'],  # 有概念板块联动的股票，value为概念板块详情
+                    '概念板块更新时间':
+                    base_shared_data['概念板块更新时间'],
                     '行业板块效应':
                     base_shared_data['行业板块效应'],  # 有行业板块联动的股票，value为行业板块详情
+                    '行业板块更新时间':
+                    base_shared_data['行业板块更新时间'],
                     '个股资金流入':
                     base_shared_data['个股资金流入'],  # 资金流入满足的股票，value为资金流详情
+                    '个股资金流入更新时间':
+                    base_shared_data['个股资金流入更新时间'],
                     '涨停池':
                     shadow_manager_proxies['涨停池'],  # key 为股票代码，value为一个string，涨停/回封时间戳用逗号分隔
                     '炸板池':

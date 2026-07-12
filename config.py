@@ -107,6 +107,8 @@ MONITOR_LOG_PATH = os.path.join(
     datetime.today().strftime('%Y-%m-%d-%H%M%S'),
 )
 MONITOR_INTERVAL = 1  # 监控间隔(s)
+TICK_PROCESSOR_COUNT = 8  # 按股票代码固定分片，保证单股 Tick 严格有序
+SHADOW_TICK_PROCESSOR_COUNT = 4
 STOCK_TO_CONCEPT_MAPPING_FILE = r"output\concept_sector_data\THS\stock_to_concept_mapping.json" if SECTOR_DATA_SOURCE == 'THS' else r"output\concept_sector_data\stock_to_concept_mapping.json"  # 概念板块映射文件
 STOCK_TO_INDUSTRY_MAPPING_FILE = r"output\industry_sector_data\THS\stock_to_industry_mapping.json" if SECTOR_DATA_SOURCE == 'THS' else r"output\industry_sector_data\stock_to_industry_mapping.json"  # 行业板块映射文件
 
@@ -123,6 +125,11 @@ MIN_TURNOVER_RATE_THRESHOLD = 3  # 换手率最低阈值
 
 MIN_VOLUME_RATIO_THRESHOLD = 0.7  # 最小成交量比率阈值
 
+# 实时辅助数据必须在有效期内才能参与买入。板块数据每 10 秒刷新，资金流
+# 默认每 60 秒刷新；这里为短暂抖动留出余量，但不允许沿用陈旧信号。
+MAX_SECTOR_DATA_AGE_SECONDS = 60
+MAX_CAPITAL_FLOW_DATA_AGE_SECONDS = 180
+
 STOP_LOSS_RATE = 0.05  # 止损率，跌破止损价则卖出
 MAX_CANCEL_COUNT = 25  # 最大撤单次数，超过则不再排板买入
 
@@ -132,6 +139,11 @@ VOLATILITY_RATIO_MIN = 0.5  # 仓位调整最小倍数
 VOLATILITY_RATIO_MAX = 1.5  # 仓位调整最大倍数
 
 FIRST_LIMIT_TIME_CUTOFF = '14:30'  # 首次涨停时间截止点，超过则不扫首封板
+
+# 扫板时只计算涨停价（含容差）上的卖盘待成交金额，避免把低价档卖盘
+# 错当成拉板成本。A 股行情价差通常为 0.01 元，这里给半个价差容差。
+LIMIT_PRICE_TOLERANCE = 0.005
+MAX_SWEEP_REQUIRED_CAPITAL = 3e6
 
 # U7升级：LLM 盘前板块预判
 ENABLE_PRE_MARKET_LLM_ANALYSIS = True  # 是否启用盘前LLM分析

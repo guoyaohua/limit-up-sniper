@@ -7,7 +7,7 @@ check_order_successed 模拟成交判断、create_whole_quote_task 订阅任务�
 
 import time
 import traceback
-import numpy as np
+import zlib
 from queue import Empty
 from functools import partial
 from multiprocessing import current_process, Value
@@ -31,7 +31,10 @@ from infra.data_helpers import (
     _calc_limit_up_break_duration,
 )
 from infra.task_manager import CallbackHeartbeatMonitor
-from core.decisions import should_buy, should_cancel, should_sell
+from core.decisions import (
+    should_buy, should_cancel, should_sell,
+    calculate_limit_up_sweep_capital,
+)
 from core.trailing_stop import calculate_trailing_stop_prices
 from infra.trade_log import record_strategy_event
 
@@ -94,15 +97,15 @@ def on_data(datas,
         if heartbeat_monitor is not None:
             heartbeat_monitor.update()
 
-        tick_queue.put(datas)
+        _dispatch_ticks(datas, tick_queue)
         if shadow_tick_queue:
-            shadow_tick_queue.put(datas)
+            _dispatch_ticks(datas, shadow_tick_queue)
 
         # 记录日志
         stock_code = list(datas.keys())[0]
         time_now = datetime.now().strftime('%H:%M')
         latency = _calc_delay_time(datas[stock_code]['time'])
-        queue_size = tick_queue.qsize()
+        queue_size = _queue_size(tick_queue)
         msg = f'【回调】【Tick】延迟：{latency}s，数据大小：{len(datas)}，队列大小：{queue_size}'
         logger.debug(msg)
 
@@ -119,6 +122,47 @@ def on_data(datas,
         # 记录错误到心跳监控器
         if heartbeat_monitor is not None:
             heartbeat_monitor.record_error()
+
+
+def _queue_partition(stock_code, partition_count):
+    """Stable queue partition independent of Python's randomized hash."""
+    if partition_count <= 0:
+        raise ValueError('partition_count 必须大于 0')
+    return zlib.crc32(stock_code.encode('utf-8')) % partition_count
+
+
+def _dispatch_ticks(datas, queues):
+    """Dispatch every stock to one deterministic FIFO queue.
+
+    Consecutive ticks for the same stock can otherwise be processed by
+    different workers in reverse completion order, corrupting previous-price,
+    break/reseal and shrinking-offer signals.  A single Queue is still
+    accepted for API compatibility.
+    """
+    if isinstance(queues, (list, tuple)):
+        buckets = {}
+        for stock_code, tick in datas.items():
+            partition = _queue_partition(stock_code, len(queues))
+            buckets.setdefault(partition, {})[stock_code] = tick
+        for partition, payload in buckets.items():
+            queues[partition].put(payload)
+        return
+    queues.put(datas)
+
+
+def _queue_size(queues):
+    if isinstance(queues, (list, tuple)):
+        total = 0
+        for queue in queues:
+            try:
+                total += queue.qsize()
+            except (AttributeError, NotImplementedError):
+                pass
+        return total
+    try:
+        return queues.qsize()
+    except (AttributeError, NotImplementedError):
+        return -1
 
 
 # ---------------------------------------------------------------------------- #
@@ -880,7 +924,7 @@ def process_tick_data(shared_data,
                 with stock_status['拉板所需资金'].get_lock():
                     stock_status['拉板所需资金'].value = (
                         0.0 if not is_near_limit_up else
-                        np.dot(data['bidPrice'], data['bidVol']) * 100)
+                        calculate_limit_up_sweep_capital(data, limit_up_price))
 
             # ----------------------------------- 记录日志 ----------------------------------- #
             if datas:  # 性能优化：只在有数据时记录日志

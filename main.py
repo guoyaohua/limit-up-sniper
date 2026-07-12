@@ -30,6 +30,7 @@ from config import (
     IWENCAI_HEADLESS,
     IWENCAI_PAGE_SIZE, IWENCAI_MAX_PAGES,
     CLIENT_NAME, CLIENT_PATH, STOCK_ACCOUNT,
+    TICK_PROCESSOR_COUNT, SHADOW_TICK_PROCESSOR_COUNT,
 )
 from infra.common_enums import *
 from infra.utils import send_email, init_logger
@@ -158,11 +159,19 @@ def main():
         raise e
 
     # 数据队列
-    tick_queue = Queue(maxsize=10000)
+    # 同一股票固定路由到同一 FIFO 队列，避免多个消费者把连续 Tick
+    # 乱序写入共享状态；不同股票仍可并行处理。
+    tick_queue = [
+        Queue(maxsize=10000 // TICK_PROCESSOR_COUNT)
+        for _ in range(TICK_PROCESSOR_COUNT)
+    ]
     order_queue = Queue(maxsize=100)
 
     # 影子模式
-    shadow_tick_queue = Queue(maxsize=10000) if ENABLE_SHADOW_SIGNAL else None
+    shadow_tick_queue = ([
+        Queue(maxsize=10000 // SHADOW_TICK_PROCESSOR_COUNT)
+        for _ in range(SHADOW_TICK_PROCESSOR_COUNT)
+    ] if ENABLE_SHADOW_SIGNAL else None)
     shadow_order_queue = Queue(maxsize=100) if ENABLE_SHADOW_SIGNAL else None
 
     # 初始化 TaskManager
@@ -193,12 +202,12 @@ def main():
             logger.warning(f'[盘前分析] 失败，策略正常运行: {e}')
 
     # 注册 Tick 数据处理进程
-    logger.info('注册 8 个Tick数据处理进程...')
-    for idx in range(8):
+    logger.info(f'注册 {TICK_PROCESSOR_COUNT} 个Tick数据处理进程...')
+    for idx in range(TICK_PROCESSOR_COUNT):
         task_manager.register_task(
             TaskInfo(name=f'Tick数据处理进程-{idx}',
                      target=process_tick_data,
-                     args=(shared_data, tick_queue, order_queue),
+                     args=(shared_data, tick_queue[idx], order_queue),
                      task_type="process",
                      daemon=True,
                      restart_on_failure=True,
@@ -239,13 +248,13 @@ def main():
                                               base_shared_data=shared_data,
                                               new_stock_list=new_stock_list)
 
-        shadow_process_count = 4
+        shadow_process_count = SHADOW_TICK_PROCESSOR_COUNT
         logger.info(f'[影子模式] 注册 {shadow_process_count} 个Tick数据处理进程...')
         for idx in range(shadow_process_count):
             task_manager.register_task(
                 TaskInfo(name=f'[影子模式] Tick数据处理进程-{idx}',
                          target=process_tick_data,
-                         args=(shadow_shared_data, shadow_tick_queue,
+                         args=(shadow_shared_data, shadow_tick_queue[idx],
                                shadow_order_queue, True),
                          task_type="process",
                          daemon=True,

@@ -22,8 +22,8 @@
 
 **职责**：
 1. 更新心跳时间戳（标记数据源活跃）
-2. 将 Tick 数据放入 `tick_queue`（8 个工作进程消费）
-3. 如果启用影子模式，同时放入 `shadow_tick_queue`
+2. 按股票代码稳定分片到 8 个 `tick_queue`（每个队列单进程 FIFO 消费）
+3. 如果启用影子模式，同时分片到 4 个 `shadow_tick_queue`
 4. 日志记录延迟和队列大小
 5. 若延迟超过 `LATENCY_THRESHOLD`(20s) 且在交易时间内，设置 `stop_flag`
 

@@ -104,6 +104,13 @@ LLM 优先板块折扣：优先板块内的股票，封单阈值额外 × 0.7。
 | `MAX_UP_LIMIT_BREAK_COUNT` | int | `5` | 最大炸板次数（超过加黑名单） |
 | `MAX_CANCEL_COUNT` | int | 配置值 | 单只股票最大撤单次数 |
 | `MIN_LIMIT_ORDER_AMOUNT` | float | 2000万 | 最低封单金额要求 |
+| `MIN_VOLUME_RATIO_THRESHOLD` | float | `0.7` | 时段归一化量比下限；盘中累计量按已交易分钟折算 |
+| `MAX_SWEEP_REQUIRED_CAPITAL` | float | 300万 | 扫板时可见卖盘的最大待吃金额 |
+| `MAX_SECTOR_DATA_AGE_SECONDS` | int | `60` | 板块效应最大数据年龄，超时禁止买入 |
+| `MAX_CAPITAL_FLOW_DATA_AGE_SECONDS` | int | `180` | 个股资金流最大数据年龄，超时禁止买入 |
+
+扫板资金只统计涨停价以内的委卖档位 `askPrice × askVol × 100`，买盘深度
+不计入拉板成本。实时板块或资金流时间戳缺失时采用 fail-closed，不生成买入信号。
 
 ---
 

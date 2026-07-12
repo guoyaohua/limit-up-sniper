@@ -160,55 +160,72 @@ def calculate_stock_gene(data, N=250):
         data['近五日涨停次数'] = data['涨停'].rolling(5, min_periods=1).sum()
         data['近十日涨停次数'] = data['涨停'].rolling(10, min_periods=1).sum()
 
-        # 3. 平均溢价 - 使用 mean()（自动忽略NaN）
-        data['涨停或炸板次日开盘平均溢价'] = data['涨停或炸板次日开盘溢价'].rolling(
-            N, min_periods=1).mean()
-        data['涨停或炸板次日收盘平均溢价'] = data['涨停或炸板次日收盘溢价'].rolling(
-            N, min_periods=1).mean()
-        data['首板涨停或炸板次日开盘平均溢价'] = data['首板涨停或炸板次日开盘溢价'].rolling(
-            N, min_periods=1).mean()
-        data['首板涨停或炸板次日收盘平均溢价'] = data['首板涨停或炸板次日收盘溢价'].rolling(
-            N, min_periods=1).mean()
-        data['涨停次日开盘平均溢价'] = data['涨停次日开盘溢价'].rolling(N, min_periods=1).mean()
-        data['涨停次日收盘平均溢价'] = data['涨停次日收盘溢价'].rolling(N, min_periods=1).mean()
-        data['首板次日开盘平均溢价'] = data['首板次日开盘溢价'].rolling(N, min_periods=1).mean()
-        data['首板次日收盘平均溢价'] = data['首板次日收盘溢价'].rolling(N, min_periods=1).mean()
+        # 3. 次日结果的统计特征必须再滞后一日。原始次日溢价归属于事件日 t，
+        # 但它直到 t+1 才可观测；若直接在 t 行 rolling，会让历史逐日回测
+        # 偷看下一日开/收盘。保留原始结果列用于复盘，所有决策特征只使用
+        # shift(1) 后的“当日已知结果”。
+        next_day_columns = [
+            '涨停或炸板次日开盘溢价', '涨停或炸板次日收盘溢价',
+            '首板涨停或炸板次日开盘溢价', '首板涨停或炸板次日收盘溢价',
+            '涨停次日开盘溢价', '涨停次日收盘溢价',
+            '首板次日开盘溢价', '首板次日收盘溢价',
+        ]
+        known_next_day = {
+            column: data[column].shift(1) for column in next_day_columns
+        }
 
-        # 4. 溢价超5%次数 - 使用向量化比较 + rolling().sum()
-        data['涨停次日开盘溢价超5%次数'] = (data['涨停次日开盘溢价'] > 0.05).rolling(
-            N, min_periods=1).sum()
-        data['涨停次日收盘溢价超5%次数'] = (data['涨停次日收盘溢价'] > 0.05).rolling(
-            N, min_periods=1).sum()
-        data['首板次日开盘溢价超5%次数'] = (data['首板次日开盘溢价'] > 0.05).rolling(
-            N, min_periods=1).sum()
-        data['首板次日收盘溢价超5%次数'] = (data['首板次日收盘溢价'] > 0.05).rolling(
-            N, min_periods=1).sum()
+        aggregate_columns = {
+            '涨停或炸板次日开盘平均溢价': '涨停或炸板次日开盘溢价',
+            '涨停或炸板次日收盘平均溢价': '涨停或炸板次日收盘溢价',
+            '首板涨停或炸板次日开盘平均溢价': '首板涨停或炸板次日开盘溢价',
+            '首板涨停或炸板次日收盘平均溢价': '首板涨停或炸板次日收盘溢价',
+            '涨停次日开盘平均溢价': '涨停次日开盘溢价',
+            '涨停次日收盘平均溢价': '涨停次日收盘溢价',
+            '首板次日开盘平均溢价': '首板次日开盘溢价',
+            '首板次日收盘平均溢价': '首板次日收盘溢价',
+        }
+        for output_column, source_column in aggregate_columns.items():
+            data[output_column] = known_next_day[source_column].rolling(
+                N, min_periods=1).mean()
 
-        # 5. 红盘率 - 使用向量化比较（注意：gt()方法会保持NaN，比>运算符更准确）
-        limit_up_next_close_red_sum = data['涨停次日收盘溢价'].gt(0).rolling(
-            N, min_periods=1).sum()
-        limit_up_next_close_red_count = data['涨停次日收盘溢价'].rolling(
+        # 4. 溢价超5%次数；未知结果保持 NaN，不把它误当成失败样本。
+        for prefix in ('涨停', '首板'):
+            for session in ('开盘', '收盘'):
+                source_column = f'{prefix}次日{session}溢价'
+                known = known_next_day[source_column]
+                success = known.gt(0.05).where(known.notna())
+                data[f'{prefix}次日{session}溢价超5%次数'] = success.rolling(
+                    N, min_periods=1).sum()
+
+        # 5. 红盘率。分子和分母都只统计已经结算的次日样本。
+        known_limit_close = known_next_day['涨停次日收盘溢价']
+        limit_up_next_close_red_sum = known_limit_close.gt(0).where(
+            known_limit_close.notna()).rolling(N, min_periods=1).sum()
+        limit_up_next_close_red_count = known_limit_close.rolling(
             N, min_periods=1).count()
         data[
             '涨停次日收盘红盘率'] = limit_up_next_close_red_sum / limit_up_next_close_red_count
 
-        limit_up_next_open_red_sum = data['涨停次日开盘溢价'].gt(0).rolling(
-            N, min_periods=1).sum()
-        limit_up_next_open_red_count = data['涨停次日开盘溢价'].rolling(
+        known_limit_open = known_next_day['涨停次日开盘溢价']
+        limit_up_next_open_red_sum = known_limit_open.gt(0).where(
+            known_limit_open.notna()).rolling(N, min_periods=1).sum()
+        limit_up_next_open_red_count = known_limit_open.rolling(
             N, min_periods=1).count()
         data[
             '涨停次日开盘红盘率'] = limit_up_next_open_red_sum / limit_up_next_open_red_count
 
-        first_board_next_close_red_sum = data['首板次日收盘溢价'].gt(0).rolling(
-            N, min_periods=1).sum()
-        first_board_next_close_red_count = data['首板次日收盘溢价'].rolling(
+        known_first_close = known_next_day['首板次日收盘溢价']
+        first_board_next_close_red_sum = known_first_close.gt(0).where(
+            known_first_close.notna()).rolling(N, min_periods=1).sum()
+        first_board_next_close_red_count = known_first_close.rolling(
             N, min_periods=1).count()
         data[
             '首板次日收盘红盘率'] = first_board_next_close_red_sum / first_board_next_close_red_count
 
-        first_board_next_open_red_sum = data['首板次日开盘溢价'].gt(0).rolling(
-            N, min_periods=1).sum()
-        first_board_next_open_red_count = data['首板次日开盘溢价'].rolling(
+        known_first_open = known_next_day['首板次日开盘溢价']
+        first_board_next_open_red_sum = known_first_open.gt(0).where(
+            known_first_open.notna()).rolling(N, min_periods=1).sum()
+        first_board_next_open_red_count = known_first_open.rolling(
             N, min_periods=1).count()
         data[
             '首板次日开盘红盘率'] = first_board_next_open_red_sum / first_board_next_open_red_count
@@ -222,17 +239,21 @@ def calculate_stock_gene(data, N=250):
         else:
             data['最近一次涨停'] = np.nan
 
-        denominator = data['涨停次数'].astype(float)
+        # 比例分母必须是已有次日结果的样本数，不能把当日刚涨停、尚未知道
+        # 次日表现的事件算进分母。开盘/收盘通常同时存在，仍分别计算以兼容
+        # 停牌或缺失行情。
+        open_denominator = known_limit_open.rolling(N, min_periods=1).count()
+        close_denominator = known_limit_close.rolling(N, min_periods=1).count()
         data['涨停次日开盘溢价超5%比例'] = np.divide(data['涨停次日开盘溢价超5%次数'],
-                                          denominator,
-                                          out=np.full_like(
-                                              denominator, np.nan),
-                                          where=denominator != 0)
+                                           open_denominator,
+                                           out=np.full_like(
+                                               open_denominator, np.nan),
+                                           where=open_denominator != 0)
         data['涨停次日收盘溢价超5%比例'] = np.divide(data['涨停次日收盘溢价超5%次数'],
-                                          denominator,
-                                          out=np.full_like(
-                                              denominator, np.nan),
-                                          where=denominator != 0)
+                                           close_denominator,
+                                           out=np.full_like(
+                                               close_denominator, np.nan),
+                                           where=close_denominator != 0)
 
         # 添加原代码中存在的 '首板涨停' 列
         data['首板涨停'] = is_first_limit_up

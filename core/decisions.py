@@ -11,7 +11,6 @@ import traceback
 from io import StringIO
 from datetime import datetime
 
-import numpy as np
 import pandas as pd
 from infra.xtconstant_compat import xtconstant
 from loguru import logger
@@ -25,7 +24,11 @@ from config import (
     WATCHLIST_POSITION_RATIO,
     MIN_TURNOVER_RATE_THRESHOLD,
     MIN_VOLUME_RATIO_THRESHOLD,
+    MAX_SECTOR_DATA_AGE_SECONDS,
+    MAX_CAPITAL_FLOW_DATA_AGE_SECONDS,
     MIN_LIMIT_ORDER_AMOUNT,
+    LIMIT_PRICE_TOLERANCE,
+    MAX_SWEEP_REQUIRED_CAPITAL,
     MAX_CANCEL_COUNT,
     STOP_LOSS_RATE,
     STRATEGY_NAME,
@@ -55,6 +58,85 @@ def _calculate_turnover_rate(tick_data, stock_info):
     if float_shares <= 0:
         raise ValueError(f'流通股本数据异常: {float_shares}')
     return tick_data.get('pvolume', 0) / float_shares * 100
+
+
+def _elapsed_trading_minutes(timestamp_ms: int) -> float:
+    """Return elapsed continuous-auction minutes for one XTQuant tick.
+
+    The lunch break is excluded.  A small positive floor keeps the opening
+    minute numerically stable and prevents division by zero.
+    """
+    current = datetime.fromtimestamp(timestamp_ms / 1000)
+    minute_of_day = current.hour * 60 + current.minute + current.second / 60
+    morning_start = 9 * 60 + 30
+    morning_end = 11 * 60 + 30
+    afternoon_start = 13 * 60
+    afternoon_end = 15 * 60
+
+    if minute_of_day <= morning_start:
+        return 1.0
+    if minute_of_day <= morning_end:
+        return max(1.0, minute_of_day - morning_start)
+    if minute_of_day < afternoon_start:
+        return 120.0
+    if minute_of_day <= afternoon_end:
+        return 120.0 + minute_of_day - afternoon_start
+    return 240.0
+
+
+def calculate_intraday_volume_ratio(tick_data, average_daily_volume):
+    """Estimate relative volume using only information known at the tick.
+
+    XTQuant ``volume`` is cumulative intraday volume while the stock-pool
+    denominator is a full-day average.  Comparing the two directly suppresses
+    early limit-ups.  Scale the cumulative volume by elapsed trading time so
+    the ratio remains comparable across the session without look-ahead data.
+    """
+    if average_daily_volume <= 0:
+        raise ValueError(f'5日平均成交量数据异常: {average_daily_volume}')
+    timestamp_ms = tick_data.get('time')
+    if not timestamp_ms:
+        raise ValueError('tick 缺少 time，无法计算时段归一化量比')
+    elapsed_minutes = _elapsed_trading_minutes(int(timestamp_ms))
+    expected_volume = average_daily_volume * elapsed_minutes / 240.0
+    return max(0.0, float(tick_data.get('volume', 0)) / expected_volume)
+
+
+def calculate_limit_up_sweep_capital(tick_data, limit_up_price):
+    """Return visible sell-side capital that must be consumed to seal.
+
+    Only ask levels priced no higher than the daily limit are executable before
+    the stock seals.  Bid depth represents demand and must never be counted as
+    capital required to lift the offer.
+    """
+    ask_prices = tick_data.get('askPrice') or []
+    ask_volumes = tick_data.get('askVol') or []
+    required = 0.0
+    for price, volume in zip(ask_prices, ask_volumes):
+        price = float(price or 0)
+        volume = float(volume or 0)
+        if price <= 0 or volume <= 0:
+            continue
+        if price <= limit_up_price + LIMIT_PRICE_TOLERANCE:
+            required += price * volume * 100
+    return required
+
+
+def _timestamp_is_fresh(shared_data, key, max_age_seconds, now=None):
+    timestamp_obj = shared_data.get(key)
+    if timestamp_obj is None:
+        return False
+    if hasattr(timestamp_obj, 'get_lock'):
+        with timestamp_obj.get_lock():
+            timestamp = timestamp_obj.value
+    else:
+        timestamp = getattr(timestamp_obj, 'value', timestamp_obj)
+    now = time.time() if now is None else now
+    try:
+        age = now - float(timestamp)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= age <= max_age_seconds
 
 
 def _add_to_watchlist(shared_data,
@@ -344,19 +426,20 @@ def should_buy(shared_data,
             buy_reason += f'[换手率] 满足买入条件, 换手率 {turnover_rate:.1f}%\n'
 
         # -------------------------------- 2. 量比>=1.5 -------------------------------- #
-        avg_volume_5d = stock_info['5日平均成交量']
-        if avg_volume_5d > 0:
-            volume_ratio = tick_data['volume'] / avg_volume_5d
-            if volume_ratio >= MIN_VOLUME_RATIO_THRESHOLD:
-                buy_reason += f'[量比] 满足买入条件, 量比 {volume_ratio:.2f} >= {MIN_VOLUME_RATIO_THRESHOLD}\n'
-            else:
-                logger.debug(
-                    f'{log_prefix}[不买入-量比] {stock_code} {volume_ratio:.2f} < {MIN_VOLUME_RATIO_THRESHOLD} 不满足买入条件'
-                )
-                return False
+        try:
+            volume_ratio = calculate_intraday_volume_ratio(
+                tick_data, stock_info['5日平均成交量'])
+        except ValueError as exc:
+            logger.debug(f'{log_prefix}[不买入-量比异常] {stock_code} {exc}')
+            return False
+        if volume_ratio >= MIN_VOLUME_RATIO_THRESHOLD:
+            buy_reason += (
+                f'[时段量比] 满足买入条件, 量比 {volume_ratio:.2f} '
+                f'>= {MIN_VOLUME_RATIO_THRESHOLD}\n')
         else:
             logger.debug(
-                f'{log_prefix}[不买入-量比异常] {stock_code} 5日平均成交量为0，不满足买入条件')
+                f'{log_prefix}[不买入-量比] {stock_code} 时段量比 '
+                f'{volume_ratio:.2f} < {MIN_VOLUME_RATIO_THRESHOLD} 不满足买入条件')
             return False
 
         # ---------------------------------- 3. 板块效应 --------------------------------- #
@@ -364,16 +447,21 @@ def should_buy(shared_data,
         leading_count = 0
         total_sectors = 0
         # 检查是否满足板块效应
-        if stock_code in concept_sector_effect or stock_code in industry_sector_effect:
+        concept_is_fresh = _timestamp_is_fresh(
+            shared_data, '概念板块更新时间', MAX_SECTOR_DATA_AGE_SECONDS)
+        industry_is_fresh = _timestamp_is_fresh(
+            shared_data, '行业板块更新时间', MAX_SECTOR_DATA_AGE_SECONDS)
+        if ((concept_is_fresh and stock_code in concept_sector_effect) or
+                (industry_is_fresh and stock_code in industry_sector_effect)):
             details = ''
             # 板块效应，满足买入条件
-            if stock_code in concept_sector_effect:
+            if concept_is_fresh and stock_code in concept_sector_effect:
                 _total_sectors, _leading_count = leading_stock_check(
                     concept_sector_effect.get(stock_code, ''), stock_code)
                 leading_count += _leading_count
                 total_sectors += _total_sectors
                 details += concept_sector_effect.get(stock_code, '')
-            if stock_code in industry_sector_effect:
+            if industry_is_fresh and stock_code in industry_sector_effect:
                 _total_sectors, _leading_count = leading_stock_check(
                     industry_sector_effect.get(stock_code, ''), stock_code)
                 leading_count += _leading_count
@@ -405,11 +493,16 @@ def should_buy(shared_data,
                     return False
 
         # ---------------------------------- 4. 资金流入 --------------------------------- #
-        if stock_code in individual_capital_inflow:
+        capital_flow_is_fresh = _timestamp_is_fresh(
+            shared_data, '个股资金流入更新时间',
+            MAX_CAPITAL_FLOW_DATA_AGE_SECONDS)
+        if capital_flow_is_fresh and stock_code in individual_capital_inflow:
             # 个股资金流入
             buy_reason += f'[资金流入] 满足买入条件, {individual_capital_inflow.get(stock_code,"")}\n'
         else:
-            logger.debug(f'{log_prefix}[不买入-资金流入] {stock_code} 不满足买入条件')
+            logger.debug(
+                f'{log_prefix}[不买入-资金流入] {stock_code} '
+                f'资金流信号不存在或已过期，不满足买入条件')
             return False
 
         # ---------------------------------------------------------------------------- #
@@ -488,15 +581,18 @@ def should_buy(shared_data,
 
             # ----------------------------------- 扫板前提 ----------------------------------- #
             # 拉涨停所需资金变小 且 小于300W
-            limit_up_amount_required = np.dot(tick_data['bidPrice'],
-                                              tick_data['bidVol']) * 100
+            limit_up_amount_required = calculate_limit_up_sweep_capital(
+                tick_data, stock_info['涨停价'])
             with stock_status['拉板所需资金'].get_lock():
                 required_capital = stock_status['拉板所需资金'].value
             if not required_capital:
                 return False
-            if limit_up_amount_required > required_capital or limit_up_amount_required > 3e6:
+            if (limit_up_amount_required > required_capital or
+                    limit_up_amount_required > MAX_SWEEP_REQUIRED_CAPITAL):
                 logger.debug(
-                    f'{log_prefix}[不买入-拉板资金] [扫板] {stock_code} 拉涨停所需资金 {limit_up_amount_required} > {required_capital} 或 > 300W, 不满足扫板买入条件'
+                    f'{log_prefix}[不买入-拉板资金] [扫板] {stock_code} '
+                    f'卖盘拉板资金 {limit_up_amount_required} > 前值 {required_capital} '
+                    f'或 > {MAX_SWEEP_REQUIRED_CAPITAL}, 不满足扫板买入条件'
                 )
                 return False
             # 股价下跌趋势则不扫板
