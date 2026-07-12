@@ -64,6 +64,7 @@ def test_live_marks_update_shadow_equity_and_position_view():
         "股票代码": "000001.SZ",
         "委托价格": 10.0,
         "委托数量": 1_000,
+        # A sweep is submitted while visible ask liquidity still exists.
         "快照": _tick(10.0),
     }
 
