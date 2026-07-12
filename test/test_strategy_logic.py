@@ -24,6 +24,16 @@ from core.interpolation import (
 )
 
 
+class _HotStock:
+    def __init__(self, code, rank, concepts=None):
+        self.code = code
+        self.rank = rank
+        self.name = f'股票{code}'
+        self.change_percent = 1.23
+        self.concept_tags = concepts or []
+        self.popularity_tag = '持续上榜'
+
+
 def _strength_frame():
     data = {'股票代码': ['LOW', 'MID', 'HIGH']}
     for factor in STRENGTH_SCORE_WEIGHTS:
@@ -213,19 +223,52 @@ def test_pre_market_result_is_bounded_and_tolerates_bad_model_output():
             'invalid',
             {'sector': '超过上限', 'weight': 0.8},
         ],
+        'watch_sectors': ['低空经济'],
         'avoid_sectors': [
             {'sector': '退潮'}, '高位股', None, {'sector': '超过上限'}
         ],
         'key_stocks': ['000001.SZ', '600000', 'bad-code', 1],
+        'first_board_candidates': [{
+            'code': '000001.SZ',
+            'confidence': 0.90,
+            'sector': 'AI',
+            'evidence_sources': ['1小时热榜', '涨停基因池'],
+            'reason': '多源共振',
+            'risks': '板块转弱',
+        }, {
+            'code': '600000',
+            'confidence': 0.70,
+            'evidence_sources': ['24小时热榜'],
+        }],
     }
 
     result = pre_market_analysis._normalise_llm_result(parsed)
 
     assert result == {
         'market_outlook': '分歧',
-        'priority_sectors': {'AI': 1.0, '机器人': 0.0},
-        'avoid_sectors': ['退潮', '高位股'],
+        'priority_sectors': {
+            'AI': 1.0, '机器人': 0.0, '超过上限': 0.8
+        },
+        'watch_sectors': ['低空经济'],
+        'avoid_sectors': ['退潮', '高位股', '超过上限'],
         'key_stocks': ['000001', '600000'],
+        'first_board_candidates': [{
+            'code': '000001',
+            'confidence': 0.9,
+            'tier': 'core',
+            'sector': 'AI',
+            'evidence_sources': ['1小时热榜', '涨停基因池'],
+            'reason': '多源共振',
+            'risks': '板块转弱',
+        }, {
+            'code': '600000',
+            'confidence': 0.7,
+            'tier': 'watch',
+            'sector': '',
+            'evidence_sources': ['24小时热榜'],
+            'reason': '',
+            'risks': '',
+        }],
     }
 
 
@@ -233,6 +276,70 @@ def test_pre_market_parser_rejects_non_object_json():
     result = pre_market_analysis._parse_llm_response('[1, 2, 3]')
     assert result['priority_sectors'] == []
     assert result['market_outlook'] == '未知'
+
+
+def test_pre_market_ths_fetch_uses_real_hot_stock_fields(monkeypatch):
+    class FakeScraper:
+        def get_hot_stocks_1h(self, limit):
+            assert limit == pre_market_analysis.HOT_STOCK_LIMIT
+            return [_HotStock('000001', 1, ['银行'])]
+
+        def get_hot_stocks_24h(self, limit):
+            return [_HotStock('600000', 2, ['银行'])]
+
+        def get_hot_concept_sectors(self, limit):
+            return []
+
+        def get_hot_industry_sectors(self, limit):
+            return []
+
+    scraper_module = types.ModuleType('ths_scraper.scraper')
+    scraper_module.THSHotSpotScraper = FakeScraper
+    monkeypatch.setitem(sys.modules, 'ths_scraper.scraper', scraper_module)
+
+    result = pre_market_analysis._fetch_ths_data()
+
+    assert '000001' in result['hot_stocks_1h']
+    assert '概念:银行' in result['hot_stocks_1h']
+    assert len(result['hot_stocks_1h_raw']) == 1
+
+
+def test_pre_market_candidate_tier_uses_verified_local_sources():
+    result = pre_market_analysis._normalise_llm_result({
+        'priority_sectors': [{'sector': 'AI', 'weight': 0.9}],
+        'watch_sectors': ['机器人', '幻觉板块'],
+        'first_board_candidates': [{
+            'code': '000001',
+            'confidence': 0.95,
+            # Model tries to duplicate a single local source.
+            'evidence_sources': ['1小时热榜', '1小时热榜'],
+        }, {
+            'code': '600000',
+            'confidence': 0.82,
+            'evidence_sources': ['伪造来源'],
+        }, {
+            'code': '999999',
+            'confidence': 0.99,
+            'evidence_sources': ['1小时热榜', '涨停基因池'],
+        }],
+    })
+
+    filtered = pre_market_analysis._filter_candidates_to_evidence(
+        result,
+        {
+            '000001': {'1小时热榜'},
+            '600000': {'24小时热榜', '涨停基因池'},
+        },
+        {'AI', '机器人'},
+    )
+
+    assert filtered['watch_sectors'] == ['机器人']
+    assert filtered['first_board_candidates'][0]['tier'] == 'watch'
+    assert filtered['first_board_candidates'][1]['tier'] == 'core'
+    assert filtered['first_board_candidates'][1]['evidence_sources'] == [
+        '24小时热榜', '涨停基因池'
+    ]
+    assert filtered['key_stocks'] == ['600000']
 
 
 def test_pre_market_gene_path_uses_project_root_and_preserves_leading_zero(
@@ -249,6 +356,87 @@ def test_pre_market_gene_path_uses_project_root_and_preserves_leading_zero(
     result = pre_market_analysis._get_yesterday_limit_up_stocks()
 
     assert result == '000001 平安银行'
+
+
+def test_pre_market_candidate_pool_is_ranked_and_broad(monkeypatch, tmp_path):
+    strong_dir = tmp_path / 'output' / '强势股票'
+    strong_dir.mkdir(parents=True)
+    pd.DataFrame({
+        '股票代码': ['000001', '600000', '300001'],
+        '股票名称': ['甲', '乙', '丙'],
+        '涨停基因打分': [70.0, 95.0, 80.0],
+        '首板封板率': [0.8, 0.9, 0.85],
+        '首板次日收盘红盘率': [0.6, 0.7, 0.65],
+    }).to_csv(strong_dir / '强势股票_20260710.csv', index=False)
+    monkeypatch.setattr(pre_market_analysis, 'ROOT_DIR', str(tmp_path))
+
+    pool = pre_market_analysis._get_first_board_candidate_pool()
+
+    assert [item['code'] for item in pool] == [
+        '600000', '300001', '000001'
+    ]
+    assert pool[0]['rank'] == 1
+    assert pool[0]['seal_rate'] == pytest.approx(0.9)
+
+
+def test_candidate_evidence_merges_hot_lists_and_gene_pool():
+    text, sources, sectors = pre_market_analysis._build_candidate_evidence(
+        {
+            'hot_stocks_1h_raw': [_HotStock('000001', 1, ['AI'])],
+            'hot_stocks_24h_raw': [
+                _HotStock('000001', 3, ['机器人']),
+                _HotStock('600000', 2, ['银行']),
+            ],
+            'hot_concept_sectors_raw': [],
+            'hot_industry_sectors_raw': [],
+        },
+        [{
+            'code': '000001', 'name': '甲', 'rank': 2,
+            'gene_score': 88.0, 'seal_rate': 0.85,
+            'next_day_red_rate': 0.7,
+        }],
+    )
+
+    assert sources['000001'] == {
+        '1小时热榜', '24小时热榜', '涨停基因池'
+    }
+    assert sources['600000'] == {'24小时热榜'}
+    assert {'AI', '机器人', '银行'} <= sectors
+    assert '历史首板封板率=85.0%' in text
+
+
+def test_exploration_candidates_are_local_market_codes_only():
+    result = {
+        'first_board_candidates': [
+            {'code': '000001', 'tier': 'core'},
+            {'code': '600000', 'tier': 'watch'},
+            {'code': '999999', 'tier': 'watch'},
+            {'code': 'bad', 'tier': 'core'},
+        ]
+    }
+
+    codes = pre_market_analysis.get_exploration_candidate_codes(
+        result, ['000001.SZ', '600000.SH'])
+
+    assert codes == ['000001.SZ', '600000.SH']
+
+
+def test_pre_market_v2_prompt_has_complete_placeholders():
+    template = pre_market_analysis._load_prompt_template()
+
+    rendered = template.format(
+        current_time='2026-07-12 09:15',
+        hot_stocks_1h='one-hour',
+        hot_stocks_24h='day',
+        hot_concept_sectors='concepts',
+        hot_industry_sectors='industries',
+        yesterday_limit_up_stocks='yesterday',
+        first_board_candidate_evidence='candidates',
+    )
+
+    assert 'one-hour' in rendered
+    assert 'candidates' in rendered
+    assert 'first_board_candidates' in rendered
 
 
 def test_pre_market_llm_client_receives_strategy_timeout(monkeypatch):

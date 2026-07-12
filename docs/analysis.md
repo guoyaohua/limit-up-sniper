@@ -16,7 +16,9 @@
 
 ### 2.1 功能概述
 
-利用大语言模型分析同花顺热榜数据，预测当日可能活跃的板块方向，生成板块优先级权重。预测结果用于买入决策时的**封单阈值折扣**（优先板块降低 30% 门槛）。
+利用大语言模型分析同花顺热榜与历史股性，输出板块优先级以及分层首板候选。
+优先板块仍只提供有限的封单阈值折扣；扩展候选默认只进入 simulation/影子池，
+仍须通过全部盘中硬风控，实盘核心池不会被自动放宽。
 
 ### 2.2 `run_pre_market_analysis() -> dict`
 
@@ -24,22 +26,25 @@
 
 ```
 Step 1: 加载 Prompt 模板
-        └── prompts/pre_market_sector_v1.md
+        └── prompts/pre_market_sector_v2.md
 
 Step 2: 抓取同花顺数据
+        ├── 1 小时热股排行（捕捉盘前新线索）
         ├── 24 小时热股排行
         ├── 概念板块热度排行
         └── 行业板块热度排行
 
 Step 3: 获取昨日涨停数据
-        └── output/强势股票/{date}.csv
+        ├── output/涨停列表/涨停_{date}.txt
+        └── output/强势股票/强势股票_{date}.csv（最多前 500）
 
 Step 4: 拼接 Prompt
         ├── {current_time} → 当前时间
-        ├── {hot_stocks_24h} → 热股排行
+        ├── {hot_stocks_1h} / {hot_stocks_24h} → 短期与持续热度
         ├── {hot_concept_sectors} → 概念板块
         ├── {hot_industry_sectors} → 行业板块
-        └── {yesterday_limit_up_stocks} → 昨日涨停
+        ├── {yesterday_limit_up_stocks} → 昨日涨停
+        └── {first_board_candidate_evidence} → 多源候选证据
 
 Step 5: 调用 LLM
         ├── 首选: DashScope (qwen3.5-plus / DeepSeek-V3.2)
@@ -69,7 +74,7 @@ Step 6: 解析返回 JSON
 
 ### 2.3 LLM Prompt 设计
 
-**模板文件**: `prompts/pre_market_sector_v1.md`
+**模板文件**: `prompts/pre_market_sector_v2.md`
 
 **分析框架**（要求 LLM 从四个维度思考）：
 1. **主线延续性**：昨日涨停领涨板块是否还在今日热榜？龙头是否仍活跃？
@@ -78,9 +83,9 @@ Step 6: 解析返回 JSON
 4. **资金集中度**：是否有多只同板块股票同时出现在热榜？
 
 **约束**：
-- 优先板块最多 5 个，每个须给出 0.0-1.0 权重和理由
-- 回避板块最多 3 个
-- 关键股票最多 5 只（6 位代码不带后缀）
+- 优先板块最多 8 个、观察板块最多 12 个、回避板块最多 6 个
+- 首板候选最多 30 只；只有本地验证的至少两类证据且置信度不低于 0.78 才是核心层
+- 模型声称的代码、来源和板块都会与本地输入集合求交，不能凭空扩充资格池
 
 ### 2.4 在决策中的应用
 
@@ -90,6 +95,9 @@ if stock_sector in shared_data['板块优先级']:
     sector_weight = shared_data['板块优先级'][stock_sector]
     seal_threshold *= 0.7   # LLM 优先板块，封单门槛降低 30%
 ```
+
+simulation 与影子实例还会把验证后的核心/观察候选加入其探索资格池，用于量化
+增量覆盖、封板率和收益；该动作不会改变 live 实例的强势股票池。
 
 ---
 

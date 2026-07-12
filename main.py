@@ -186,18 +186,31 @@ def main():
                                    new_stock_list=new_stock_list)
 
     # U7升级：盘前 LLM 板块预判
+    sector_priority = {}
+    exploration_candidates = []
     if ENABLE_PRE_MARKET_LLM_ANALYSIS:
         try:
-            from analysis.pre_market_analysis import run_pre_market_analysis
+            from analysis.pre_market_analysis import (
+                get_exploration_candidate_codes, run_pre_market_analysis,
+            )
             sector_priority = run_pre_market_analysis()
+            exploration_candidates = get_exploration_candidate_codes(
+                sector_priority, stock_pool)
             priority_dict = shared_data['板块优先级']
             for sector, weight in sector_priority.get('priority_sectors', {}).items():
                 priority_dict[sector] = str(weight)
             logger.info(
                 f'[盘前分析] 市场展望: {sector_priority.get("market_outlook", "未知")}，'
                 f'优先板块: {list(sector_priority.get("priority_sectors", {}).keys())}，'
-                f'回避板块: {sector_priority.get("avoid_sectors", [])}'
+                f'回避板块: {sector_priority.get("avoid_sectors", [])}，'
+                f'影子探索候选: {len(exploration_candidates)}只'
             )
+            if not IS_LIVE_TRADING and exploration_candidates:
+                # Simulation may measure the broader discovery layer directly;
+                # every candidate still passes all real-time decision filters.
+                expanded = list(dict.fromkeys(
+                    list(shared_data['强势股票']) + exploration_candidates))
+                shared_data['强势股票'] = expanded
         except Exception as e:
             logger.warning(f'[盘前分析] 失败，策略正常运行: {e}')
 
@@ -240,9 +253,11 @@ def main():
     if ENABLE_SHADOW_SIGNAL:
         logger.info('[影子模式] 开始初始化（进程数优化：4个）...')
 
+        shadow_strong_stocks = list(dict.fromkeys(
+            list(strong_stocks) + exploration_candidates))
         shadow_shared_data = init_shared_data(stock_pool,
                                               stock_info_dict,
-                                              strong_stocks,
+                                              shadow_strong_stocks,
                                               PRE_TRADE_DATE,
                                               shadow_signal_mode=True,
                                               base_shared_data=shared_data,
