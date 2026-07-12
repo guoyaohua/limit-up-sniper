@@ -173,18 +173,44 @@ if ($LASTEXITCODE -ne 0) {
     throw "XTQuant SDK 无法导入（定位结果：$Hint）。请在 .env 设置 XTQUANT_PYTHONPATH，指向包含 xtquant 文件夹的 site-packages。"
 }
 
+$RequiredSectorMappings = @(
+    (Join-Path $ProjectRoot "output\concept_sector_data\THS\stock_to_concept_mapping.json"),
+    (Join-Path $ProjectRoot "output\industry_sector_data\THS\stock_to_industry_mapping.json"),
+    (Join-Path $ProjectRoot "output\concept_sectors\THS\sector_to_stocks_mapping_latest.json"),
+    (Join-Path $ProjectRoot "output\industry_sectors\THS\sector_to_stocks_mapping_latest.json")
+)
+$MissingSectorMappings = @(
+    $RequiredSectorMappings | Where-Object {
+        (-not (Test-Path -LiteralPath $_ -PathType Leaf)) -or
+        ((Get-Item -LiteralPath $_ -ErrorAction SilentlyContinue).Length -eq 0)
+    }
+)
+if ($MissingSectorMappings.Count -gt 0 -and -not $RefreshSector) {
+    throw "缺少问财概念/行业板块映射。首次运行请使用 -RefreshSector；首次抓取可能打开 Edge，需登录问财。"
+}
+
 $ModeLabel = if ($Mode -eq "live") { "实盘" } else { "模拟" }
 Write-Host "启动前检查通过：模式=$ModeLabel，客户端=$ClientName，账号已配置（不回显）。" -ForegroundColor Green
 if ($Mode -eq "live") {
     Write-Host "警告：下一步可能发送真实委托；main.py 仍会要求输入 yes 二次确认。" -ForegroundColor Red
 }
-if ($PreflightOnly) {
-    exit 0
-}
-
 if ($RefreshSector) {
     Write-Host "正在刷新问财板块映射..." -ForegroundColor Cyan
     Invoke-NativeCommand $VenvPython (Join-Path $ProjectRoot "scraper\ths_sector_parser.py") --auto-download
+}
+$MissingSectorMappings = @(
+    $RequiredSectorMappings | Where-Object {
+        (-not (Test-Path -LiteralPath $_ -PathType Leaf)) -or
+        ((Get-Item -LiteralPath $_ -ErrorAction SilentlyContinue).Length -eq 0)
+    }
+)
+if ($MissingSectorMappings.Count -gt 0) {
+    throw "问财板块刷新完成后仍缺少概念/行业映射，拒绝启动。请检查浏览器登录状态和抓取日志。"
+}
+Write-Host "检查上一交易日涨停/首板清单..." -ForegroundColor Cyan
+Invoke-NativeCommand $VenvPython (Join-Path $ProjectRoot "scripts\prepare_market_data.py")
+if ($PreflightOnly) {
+    exit 0
 }
 
 Invoke-NativeCommand $VenvPython (Join-Path $ProjectRoot "main.py")

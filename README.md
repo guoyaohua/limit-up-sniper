@@ -171,6 +171,12 @@ GJ_SIM_STOCK_ACCOUNT=your-account-id
 `CICC_QMT_CLIENT_PATH`、`CICC_STOCK_ACCOUNT`。`.env` 已被 Git 忽略，不要把真实
 账号、路径或密钥提交到仓库。
 
+全新仓库还没有运行期板块映射。第一次启动请运行
+`.\scripts\run-simulation.cmd -RefreshSector`；该步骤可能打开 Edge，需要登录问财，
+抓取完成后会生成概念/行业映射。启动器还会检查上一交易日的涨停与首板清单。
+已有文件绝不覆盖；首次接入缺少文件时会从公开行情源生成；获取到空数据或字段异常时
+会安全终止。正常连续运行也会在每天收盘生成下一交易日所需清单。
+
 ### 每天：双击实时模拟
 
 推荐先连续运行至少 20 个交易日：
@@ -189,13 +195,13 @@ GJ_SIM_STOCK_ACCOUNT=your-account-id
 .\scripts\run-simulation.cmd -EnableShadow
 ```
 
-刷新问财板块映射并运行：
+首次运行或需要更新时，刷新问财板块映射并运行：
 
 ```powershell
 .\scripts\run-simulation.cmd -RefreshSector
 ```
 
-只做环境、账号路径和 XTQuant 导入检查，不启动策略：
+只做环境、账号路径、XTQuant、板块映射和上一交易日清单检查，不启动策略：
 
 ```powershell
 .\scripts\run-simulation.cmd -PreflightOnly
@@ -296,7 +302,7 @@ QMT 客户端、遮罩账号、策略版本和运行模式。开启影子对照�
 
 - 可成交信号数、未成交率、排板队列失效与撤单比例；
 - 收盘封板率及 Wilson 95% 区间、次日开盘/收盘收益；
-- 扣费净收益、胜率及区间、盈亏比、Profit Factor；
+- 扣费净收益、胜率及区间、平均单笔收益、Profit Factor；
 - 最大回撤、最大单笔亏损和板块集中度；
 - 提高费用/滑点、降低盘口参与率后的敏感性。
 
