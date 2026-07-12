@@ -57,10 +57,10 @@ body:
     attributes:
       label: 环境
       placeholder: |
-        Commit: 
-        Python: 
-        Windows: 
-        QMT / XTQuant（如适用）: 
+        Commit:
+        Python:
+        Windows:
+        QMT / XTQuant（如适用）:
     validations:
       required: true
   - type: textarea
