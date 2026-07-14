@@ -16,6 +16,7 @@ from tqdm import tqdm
 from loguru import logger
 
 from config import TODAY, SHOULD_DOWNLOAD_KLINE
+from core.gene_calculator import load_compatible_strong_stock_cache
 from infra.data_helpers import _round_price
 from infra.utils import send_email
 
@@ -209,7 +210,14 @@ def init_stock_pool(end_date):
     try:
         # ------------------------ 判断强势股票文件是否存在，间接判断是否需要下载K线数据 ----------------------- #
         output_path = os.path.join('output', '强势股票', f'强势股票_{TODAY}.csv')
-        have_strong_stocks = os.path.exists(output_path)
+        cached_strong_stocks, cache_incompatibility = (
+            load_compatible_strong_stock_cache(output_path, stock_pool)
+        )
+        have_strong_stocks = cached_strong_stocks is not None
+        if os.path.exists(output_path) and not have_strong_stocks:
+            logger.warning(
+                f'日期：{TODAY}，强势股票缓存需要重建；'
+                f'原因：{cache_incompatibility}')
 
         if SHOULD_DOWNLOAD_KLINE and not have_strong_stocks:
             on_data_1d = partial(_on_data, task='日线数据下载', done=done)

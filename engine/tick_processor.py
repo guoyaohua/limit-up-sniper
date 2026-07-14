@@ -39,6 +39,7 @@ from core.decisions import (
 from core.trailing_stop import calculate_trailing_stop_prices
 from infra.trade_log import record_strategy_event
 from engine.queue_fill import queued_buy_fill_progress
+from core.market_microstructure import is_sealed_limit_up_quote
 
 
 # 全局回调心跳监控器（用于监控 xtdata 回调是否正常）
@@ -522,8 +523,9 @@ def process_tick_data(shared_data,
 
                     # 性能优化：使用缓存的价格比较函数和预先缓存的价格
                     # 涨停状态, 真实封板, 买一价为涨停价
-                    is_limit_up = _check_same_price(data['bidPrice'][0],
-                                                    limit_up_price)
+                    # review 20260714: use the same conservative sealed-board
+                    # definition in live signals, simulation and backtests.
+                    is_limit_up = is_sealed_limit_up_quote(data, limit_up_price)
 
                     # 触及涨停价，委卖价格不为空，且最大委卖价格等于涨停价，卖一价格为涨停价
                     is_near_limit_up = (not is_limit_up and data['askPrice']
@@ -884,6 +886,7 @@ def process_tick_data(shared_data,
                                 'buy_type': order.get('买入类型', '排板' if is_limit_up else '扫板'),
                                 'is_limit_up': is_limit_up,
                                 'is_near_limit_up': is_near_limit_up,
+                                'limit_up_price': limit_up_price,
                             })
 
                     elif should_cancel(shared_data,

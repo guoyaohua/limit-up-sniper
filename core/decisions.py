@@ -26,6 +26,7 @@ from config import (
     MIN_VOLUME_RATIO_THRESHOLD,
     MAX_SECTOR_DATA_AGE_SECONDS,
     MAX_CAPITAL_FLOW_DATA_AGE_SECONDS,
+    MAX_MARKET_SENTIMENT_AGE_SECONDS,
     MIN_LIMIT_ORDER_AMOUNT,
     LIMIT_PRICE_TOLERANCE,
     MAX_SWEEP_REQUIRED_CAPITAL,
@@ -50,6 +51,7 @@ from infra.data_helpers import _conv_time_cached, _check_same_price
 from infra.utils import send_email
 from infra.trade_log import record_strategy_event
 from core.interpolation import interpolate_seal_threshold, interpolate_sector_requirements
+from core.market_microstructure import exposure_slot_count
 
 
 def _calculate_turnover_rate(tick_data, stock_info):
@@ -58,6 +60,27 @@ def _calculate_turnover_rate(tick_data, stock_info):
     if float_shares <= 0:
         raise ValueError(f'流通股本数据异常: {float_shares}')
     return tick_data.get('pvolume', 0) / float_shares * 100
+
+
+def _tick_event_datetime(tick_data):
+    """Return the exchange event time carried by an XTQuant tick.
+
+    Entry cut-offs must follow market-event time rather than the worker's wall
+    clock.  This keeps delayed quotes and offline replay deterministic.
+    """
+    timestamp_ms = tick_data.get('time')
+    if timestamp_ms is None:
+        raise ValueError('tick 缺少 time，无法判断买入时段')
+    try:
+        timestamp_ms = int(timestamp_ms)
+        if timestamp_ms <= 0:
+            raise ValueError
+        event_time = datetime.fromtimestamp(timestamp_ms / 1000)
+    except (TypeError, ValueError, OSError, OverflowError) as exc:
+        raise ValueError(f'tick time 非法: {timestamp_ms!r}') from exc
+    if not 2000 <= event_time.year <= 2100:
+        raise ValueError(f'tick time 超出支持范围: {timestamp_ms!r}')
+    return event_time
 
 
 def _elapsed_trading_minutes(timestamp_ms: int) -> float:
@@ -304,8 +327,15 @@ def should_buy(shared_data,
         if cancel_count is None:
             cancel_count = shared_data['撤单次数']
 
+        try:
+            tick_event_time = _tick_event_datetime(tick_data)
+        except ValueError as exc:
+            logger.error(f'{log_prefix}[不买入-Tick时间异常] {stock_code} {exc}')
+            return False
+        tick_clock = tick_event_time.strftime('%H:%M')
+
         # ------------------------------- 14:50之后不下单买入 ------------------------------- #
-        if datetime.now().strftime('%H:%M') >= '14:50':
+        if tick_clock >= '14:50':
             return False
 
         # ----------------------------- 如果非涨停或触及涨停，则跳过 ---------------------------- #
@@ -326,6 +356,13 @@ def should_buy(shared_data,
         # < 2.5: 极弱，空仓等待
         with market_sentiment_score_obj.get_lock():
             market_sentiment_score = market_sentiment_score_obj.value
+        if not _timestamp_is_fresh(
+                shared_data, '市场情绪_更新时间',
+                MAX_MARKET_SENTIMENT_AGE_SECONDS):
+            logger.debug(
+                f'{log_prefix}[不买入-市场情绪过期] {stock_code} '
+                f'情绪评分缺失或超过 {MAX_MARKET_SENTIMENT_AGE_SECONDS} 秒')
+            return False
         if market_sentiment_score < 2.5:
             logger.debug(
                 f'{log_prefix}[不买入-市场情绪] {stock_code} 市场情绪评分 {market_sentiment_score:.1f} < 2.5，市场极弱，空仓等待'
@@ -368,7 +405,17 @@ def should_buy(shared_data,
             logger.debug(f'{stock_code} 已持仓，跳过买入判断')
             return False
 
-        # --------------------------- 4. 只买入首次涨停在10:30之前的股票 -------------------------- #
+        # review 20260714: count cancellable buy orders as occupied slots.
+        # This is a fast fail-closed guard; the executor revalidates atomically
+        # against the broker immediately before placing a live order.
+        order_status = shared_data.get('委托状态', {})
+        if exposure_slot_count(holding_status, order_status) >= MAX_HOLDING_COUNT:
+            logger.debug(
+                f'{log_prefix}[不买入-持仓上限] {stock_code} 持仓及待成交买单已达 '
+                f'{MAX_HOLDING_COUNT} 个')
+            return False
+
+        # ----------------------- 4. 首次涨停不得晚于配置的截止时间 ----------------------- #
         if stock_code in limit_up_pool:
             first_limit_time = _conv_time_cached(int(
                 limit_up_pool[stock_code].split(',')[0]),
@@ -379,11 +426,10 @@ def should_buy(shared_data,
                 )
                 return False
         else:
-            # 如果当前时间超过10:30，则不扫首封板，只扫回封板
-            current_time = datetime.now().strftime('%H:%M')
-            if current_time >= FIRST_LIMIT_TIME_CUTOFF:
+            # 尚未进入涨停池时，按 Tick 事件时间限制首次触板。
+            if tick_clock >= FIRST_LIMIT_TIME_CUTOFF:
                 logger.debug(
-                    f'{log_prefix}[不买入-扫板时间] {stock_code} 当前时间 {current_time} >= {FIRST_LIMIT_TIME_CUTOFF}，跳过买入判断'
+                    f'{log_prefix}[不买入-扫板时间] {stock_code} Tick时间 {tick_clock} >= {FIRST_LIMIT_TIME_CUTOFF}，跳过买入判断'
                 )
                 return False
 

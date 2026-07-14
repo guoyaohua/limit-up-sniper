@@ -4,6 +4,7 @@ monitor/sentiment.py - 市场情绪指标计算
 从 打板策略_v2.4.py 提取的市场情绪指标计算核心函数。
 """
 
+import math
 import time
 import traceback
 
@@ -100,32 +101,46 @@ def calculate_market_sentiment_metrics(shared_data):
         )
 
         # 6. 大盘指数
-        data = xtdata.get_full_tick(
-            ['000001.SH', '000300.SH', '399006.SZ', '399001.SZ'])
-        data = pd.DataFrame(data).T.reset_index(names='股票代码')
-        data['涨跌幅'] = (data['lastPrice'] -
-                       data['lastClose']) / data['lastClose'] * 100
+        index_codes = ['000001.SH', '000300.SH', '399006.SZ', '399001.SZ']
+        raw_ticks = xtdata.get_full_tick(index_codes)
+        if not raw_ticks:
+            logger.warning('大盘指数行情为空，不刷新指数时间戳')
+            return
+        data = pd.DataFrame(raw_ticks).T.reset_index(names='股票代码')
+        if not {'股票代码', 'lastPrice', 'lastClose'}.issubset(data.columns):
+            logger.warning('大盘指数行情字段不完整，不刷新指数时间戳')
+            return
+        last_price = pd.to_numeric(data['lastPrice'], errors='coerce')
+        last_close = pd.to_numeric(data['lastClose'], errors='coerce')
+        valid_prices = (
+            last_price.map(math.isfinite)
+            & last_close.map(math.isfinite)
+            & last_price.ge(0)
+            & last_close.gt(0)
+        )
+        if not valid_prices.all():
+            logger.warning('大盘指数行情价格无效，不刷新指数时间戳')
+            return
+        data['涨跌幅'] = (last_price - last_close) / last_close * 100
+        values = {}
+        for code in index_codes:
+            series = data[data['股票代码'] == code]['涨跌幅']
+            if series.empty:
+                logger.warning(f'大盘指数 {code} 缺失，不刷新指数时间戳')
+                return
+            value = float(series.iloc[0])
+            if not math.isfinite(value):
+                logger.warning(f'大盘指数 {code} 非有限值，不刷新指数时间戳')
+                return
+            values[code] = value
 
-        # 安全地获取指数涨跌幅，避免索引错误
-        sh_data = data[data['股票代码'] == '000001.SH']['涨跌幅']
-        with shared_data['上证指数涨跌幅'].get_lock():
-            shared_data['上证指数涨跌幅'].value = sh_data.iloc[
-                0] if not sh_data.empty else 0.0
-
-        hs300_data = data[data['股票代码'] == '000300.SH']['涨跌幅']
-        with shared_data['沪深300涨跌幅'].get_lock():
-            shared_data['沪深300涨跌幅'].value = hs300_data.iloc[
-                0] if not hs300_data.empty else 0.0
-
-        cyb_data = data[data['股票代码'] == '399006.SZ']['涨跌幅']
-        with shared_data['创业板指涨跌幅'].get_lock():
-            shared_data['创业板指涨跌幅'].value = cyb_data.iloc[
-                0] if not cyb_data.empty else 0.0
-
-        sz_data = data[data['股票代码'] == '399001.SZ']['涨跌幅']
-        with shared_data['深证成指涨跌幅'].get_lock():
-            shared_data['深证成指涨跌幅'].value = sz_data.iloc[
-                0] if not sz_data.empty else 0.0
+        for shared_key, code in (
+                ('上证指数涨跌幅', '000001.SH'),
+                ('沪深300涨跌幅', '000300.SH'),
+                ('创业板指涨跌幅', '399006.SZ'),
+                ('深证成指涨跌幅', '399001.SZ')):
+            with shared_data[shared_key].get_lock():
+                shared_data[shared_key].value = values[code]
 
         with shared_data['上证指数涨跌幅'].get_lock():
             sh_val = shared_data['上证指数涨跌幅'].value

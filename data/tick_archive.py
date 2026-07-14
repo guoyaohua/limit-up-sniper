@@ -59,6 +59,17 @@ class TickBatch:
             default=0,
         )
 
+    @property
+    def received_time_ms(self) -> int:
+        """Wall-clock time when the callback reached the strategy process.
+
+        Exchange Tick timestamps and local decision-log timestamps are different
+        clock domains.  Event replay must align a logged decision with callback
+        receipt time, otherwise a quote whose exchange clock is slightly ahead
+        can make the decision appear before it was actually made.
+        """
+        return self.received_at_ns // 1_000_000 if self.received_at_ns > 0 else 0
+
 
 class TickArchiveWriter:
     """Write one immutable gzip JSONL capture segment and its manifest.
@@ -132,13 +143,25 @@ class TickArchiveWriter:
             return 0
 
         received_at_ns = int(received_at_ns or time.time_ns())
+        # XTQuant callbacks must contain mappings.  Reject a malformed symbol
+        # atomically rather than silently dropping market data from a segment
+        # that could otherwise pass integrity verification.
+        valid_ticks: list[tuple[str, dict[str, Any], int]] = []
+        for stock_code, raw_tick in datas.items():
+            if not isinstance(raw_tick, Mapping):
+                raise TypeError(f"invalid Tick payload for {stock_code}")
+            tick = _json_value(raw_tick)
+            # Parse every event time before assigning an id or touching the
+            # stream.  If one payload is malformed, callers may catch the
+            # exception and safely continue without retaining a partial batch.
+            event_ms = int(tick.get("time", 0) or 0)
+            valid_ticks.append((str(stock_code), tick, event_ms))
+        if not valid_ticks:
+            return 0
+
         self._batch_id += 1
         written = 0
-        for sequence, (stock_code, raw_tick) in enumerate(datas.items()):
-            if not isinstance(raw_tick, Mapping):
-                continue
-            tick = _json_value(raw_tick)
-            event_ms = int(tick.get("time", 0) or 0)
+        for sequence, (stock_code, tick, event_ms) in enumerate(valid_ticks):
             record = {
                 "schema_version": ARCHIVE_SCHEMA_VERSION,
                 "kind": "tick",
@@ -149,7 +172,7 @@ class TickArchiveWriter:
                 "sequence": sequence,
                 "received_at_ns": received_at_ns,
                 "event_time_ms": event_ms,
-                "stock_code": str(stock_code),
+                "stock_code": stock_code,
                 "data": tick,
             }
             self._stream.write(
@@ -159,7 +182,7 @@ class TickArchiveWriter:
             written += 1
             self._record_count += 1
             self._since_flush += 1
-            self._stock_counts[str(stock_code)] += 1
+            self._stock_counts[stock_code] += 1
             if event_ms:
                 self._first_event_ms = (
                     event_ms
@@ -231,16 +254,23 @@ def discover_tick_files(
     if isinstance(paths, (str, os.PathLike)):
         paths = [paths]
     result: list[Path] = []
+    seen: set[Path] = set()
     for raw_path in paths:
         path = Path(raw_path).expanduser().resolve()
         if path.is_dir():
-            result.extend(path.rglob("*.jsonl.gz"))
-            result.extend(path.rglob("*.jsonl"))
+            candidates = sorted(
+                set(path.rglob("*.jsonl.gz")) | set(path.rglob("*.jsonl"))
+            )
         elif path.is_file():
-            result.append(path)
+            candidates = [path]
         else:
             raise FileNotFoundError(path)
-    return sorted(set(result))
+        for candidate in candidates:
+            candidate = candidate.resolve()
+            if candidate not in seen:
+                seen.add(candidate)
+                result.append(candidate)
+    return result
 
 
 def _open_text(path: Path):
@@ -362,22 +392,65 @@ def verify_tick_archive(path: str | os.PathLike[str]) -> dict[str, Any]:
     archive_path = Path(path).expanduser().resolve()
     count = 0
     batches: set[tuple[str, str, int]] = set()
+    trade_dates: set[str] = set()
+    session_ids: set[str] = set()
     stocks: set[str] = set()
     out_of_order = 0
+    out_of_order_received = 0
     last_by_stock: dict[str, int] = {}
+    first_received_at_ns: int | None = None
+    last_received_at_ns: int | None = None
+    previous_received_at_ns = 0
     duplicate_records = 0
+    invalid_batch_structure_records = 0
+    payload_time_mismatch_records = 0
     record_keys: set[tuple[str, str, int, int]] = set()
+    closed_batch_keys: set[tuple[str, str, int]] = set()
+    current_batch_key: tuple[str, str, int] | None = None
+    current_batch_received_at_ns = 0
+    expected_sequence = 0
+    current_batch_stocks: set[str] = set()
+    last_batch_id_by_session: dict[tuple[str, str], int] = {}
     for record in iter_tick_records(archive_path):
         count += 1
+        trade_dates.add(str(record["trade_date"]))
+        session_ids.add(str(record["session_id"]))
         code = str(record["stock_code"])
         event_ms = int(record.get("event_time_ms", 0) or 0)
-        batches.add(
-            (
-                str(record["trade_date"]),
-                str(record["session_id"]),
-                int(record["batch_id"]),
-            )
+        received_at_ns = int(record.get("received_at_ns", 0) or 0)
+        batch_key = (
+            str(record["trade_date"]),
+            str(record["session_id"]),
+            int(record["batch_id"]),
         )
+        sequence = int(record["sequence"])
+        batches.add(batch_key)
+        if batch_key != current_batch_key:
+            if current_batch_key is not None:
+                closed_batch_keys.add(current_batch_key)
+            session_key = batch_key[:2]
+            expected_batch_id = last_batch_id_by_session.get(session_key, 0) + 1
+            if batch_key in closed_batch_keys or batch_key[2] != expected_batch_id:
+                invalid_batch_structure_records += 1
+            last_batch_id_by_session[session_key] = batch_key[2]
+            current_batch_key = batch_key
+            current_batch_received_at_ns = received_at_ns
+            expected_sequence = 0
+            current_batch_stocks = set()
+        if (
+            sequence != expected_sequence
+            or received_at_ns != current_batch_received_at_ns
+            or code in current_batch_stocks
+        ):
+            invalid_batch_structure_records += 1
+        expected_sequence = sequence + 1
+        current_batch_stocks.add(code)
+        try:
+            payload_event_ms = int(record["data"].get("time", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            payload_event_ms = -1
+        if payload_event_ms != event_ms:
+            payload_time_mismatch_records += 1
         record_key = (
             str(record["trade_date"]),
             str(record["session_id"]),
@@ -392,11 +465,29 @@ def verify_tick_archive(path: str | os.PathLike[str]) -> dict[str, Any]:
             out_of_order += 1
         if event_ms:
             last_by_stock[code] = event_ms
+        if received_at_ns <= 0 or (
+            previous_received_at_ns and received_at_ns < previous_received_at_ns
+        ):
+            out_of_order_received += 1
+        if received_at_ns > 0:
+            first_received_at_ns = (
+                received_at_ns
+                if first_received_at_ns is None
+                else min(first_received_at_ns, received_at_ns)
+            )
+            last_received_at_ns = (
+                received_at_ns
+                if last_received_at_ns is None
+                else max(last_received_at_ns, received_at_ns)
+            )
+            previous_received_at_ns = received_at_ns
     manifest_path = _manifest_for_archive(archive_path)
     manifest_present = manifest_path.is_file()
     checksum_matches: bool | None = None
     dropped_batches: int | None = None
     manifest_count_matches: bool | None = None
+    manifest_trade_date_matches: bool | None = None
+    manifest_session_matches: bool | None = None
     if manifest_present:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         dropped_batches = int(manifest.get("dropped_batches", 0) or 0)
@@ -409,24 +500,48 @@ def verify_tick_archive(path: str | os.PathLike[str]) -> dict[str, Any]:
             count == int(manifest.get("record_count", -1))
             and len(batches) == int(manifest.get("batch_count", -1))
         )
+        manifest_trade_date_matches = (
+            len(trade_dates) == 1
+            and manifest.get("trade_date") == next(iter(trade_dates))
+        )
+        manifest_session_matches = (
+            len(session_ids) == 1
+            and manifest.get("session_id") == next(iter(session_ids))
+        )
 
     return {
         "valid": (
             count > 0
             and out_of_order == 0
+            and out_of_order_received == 0
             and duplicate_records == 0
+            and invalid_batch_structure_records == 0
+            and payload_time_mismatch_records == 0
             and manifest_present
             and checksum_matches is True
             and manifest_count_matches is True
+            and manifest_trade_date_matches is True
+            and manifest_session_matches is True
             and dropped_batches == 0
         ),
         "record_count": count,
         "batch_count": len(batches),
         "stock_count": len(stocks),
         "out_of_order_records": out_of_order,
+        "out_of_order_received_records": out_of_order_received,
+        "trade_date": next(iter(trade_dates)) if len(trade_dates) == 1 else None,
+        "trade_date_count": len(trade_dates),
+        "session_id": next(iter(session_ids)) if len(session_ids) == 1 else None,
+        "session_id_count": len(session_ids),
+        "first_received_at_ns": first_received_at_ns,
+        "last_received_at_ns": last_received_at_ns,
         "duplicate_records": duplicate_records,
+        "invalid_batch_structure_records": invalid_batch_structure_records,
+        "payload_time_mismatch_records": payload_time_mismatch_records,
         "manifest_present": manifest_present,
         "manifest_count_matches": manifest_count_matches,
+        "manifest_trade_date_matches": manifest_trade_date_matches,
+        "manifest_session_matches": manifest_session_matches,
         "checksum_matches": checksum_matches,
         "dropped_batches": dropped_batches,
     }

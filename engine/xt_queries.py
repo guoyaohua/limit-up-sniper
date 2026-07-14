@@ -10,11 +10,46 @@ import time
 import json
 import traceback
 from datetime import datetime
+from threading import RLock
 from loguru import logger
 import schedule
 
 from config import CLIENT_PATH, STOCK_ACCOUNT, STOP_TIME
 from infra.utils import send_email
+from core.market_microstructure import merge_active_orders_with_local_reservations
+
+
+# The live executor and the two-second broker refresh run as threads in the
+# same process.  Manager.dict operations are individually safe but a
+# snapshot -> clear -> update sequence is not atomic, so protect the sequence
+# together with accepted-order reservation writes.
+_ORDER_CACHE_LOCK = RLock()
+
+
+def run_with_effective_orders_locked(shared_data, active_orders, operation):
+    """Run one broker submission decision against an atomic order view."""
+    with _ORDER_CACHE_LOCK:
+        effective = merge_active_orders_with_local_reservations(
+            active_orders, dict(shared_data['委托状态'])
+        )
+        return operation(effective)
+
+
+def replace_active_order_cache(shared_data, active_orders):
+    """Atomically reconcile one broker snapshot into shared order state."""
+    with _ORDER_CACHE_LOCK:
+        orders = merge_active_orders_with_local_reservations(
+            active_orders, dict(shared_data['委托状态'])
+        )
+        shared_data['委托状态'].clear()
+        shared_data['委托状态'].update(orders)
+        return orders
+
+
+def cache_local_buy_reservation(shared_data, stock_code, encoded):
+    """Publish an accepted BUY without racing the broker refresh thread."""
+    with _ORDER_CACHE_LOCK:
+        shared_data['委托状态'][stock_code] = encoded
 
 
 def xtposition_to_dict(xtpositions):
@@ -230,8 +265,10 @@ def query_positions_and_orders(xt_trader, acc, shared_data):
 
         # 查询委托订单
         orders = query_stock_orders(xt_trader, acc, cancelable_only=True)
-        shared_data['委托状态'].clear()
-        shared_data['委托状态'].update(orders)
+        # review 20260714: a just-accepted order may not appear in QMT's next
+        # cancellable-order snapshot.  Preserve its short-lived local
+        # reservation so that refresh cannot momentarily reopen a buy slot.
+        orders = replace_active_order_cache(shared_data, orders)
 
         logger.info(
             f'持仓和委托订单查询完成, 更新共享数据。 持仓状态: {shared_data["持仓状态"]}, 委托状态: {shared_data["委托状态"]}'

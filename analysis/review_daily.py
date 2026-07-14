@@ -2,8 +2,8 @@
 打板策略每日自动复盘脚本（U9升级）
 
 功能：
-1. 读取当日结构化交易日志与事件流
-2. 计算买卖配对与盈亏
+1. 读取截至目标日的明确成交账本与当日事件流
+2. 跨日 FIFO 配对，计算目标日实现盈亏
 3. 统计当日核心指标与决策漏斗
 4. 输出 Markdown 格式的日度复盘报告
 
@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import glob
+import math
 from datetime import datetime, date
 from collections import defaultdict
 
@@ -23,27 +24,169 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRADE_LOG_DIR = os.path.join(ROOT_DIR, 'output', 'trade_logs')
 REPORT_DIR = os.path.join(ROOT_DIR, 'output', 'review_reports')
 EVENT_LOG_FILENAME = 'events.jsonl'
+COMMISSION_RATE = float(os.getenv('LIMIT_UP_PAPER_COMMISSION_RATE', '0.0003'))
+MIN_COMMISSION = float(os.getenv('LIMIT_UP_PAPER_MIN_COMMISSION', '5'))
+STAMP_DUTY_RATE = float(
+    os.getenv('LIMIT_UP_PAPER_STAMP_DUTY_RATE', '0.0005')
+)
+TRANSFER_FEE_RATE = float(
+    os.getenv('LIMIT_UP_PAPER_TRANSFER_FEE_RATE', '0.00001')
+)
+
+
+def _normalize_date_str(date_str: str) -> str:
+    """Validate a review date before it is used as a directory name."""
+    parsed = datetime.strptime(str(date_str), '%Y%m%d')
+    normalized = parsed.strftime('%Y%m%d')
+    if normalized != str(date_str):
+        raise ValueError(f'无效日期: {date_str!r}')
+    return normalized
+
+
+def _record_trade_date(record: dict) -> str:
+    """Return YYYYMMDD from an explicit fill date, timestamp, or log dir."""
+    for field in ('trade_date', '_log_date'):
+        value = str(record.get(field, '')).strip()
+        if len(value) == 8 and value.isdigit():
+            try:
+                return _normalize_date_str(value)
+            except ValueError:
+                pass
+    timestamp = str(record.get('timestamp', '')).strip()
+    if len(timestamp) >= 10:
+        try:
+            return datetime.strptime(timestamp[:10], '%Y-%m-%d').strftime(
+                '%Y%m%d'
+            )
+        except ValueError:
+            pass
+    return ''
+
+
+def _estimated_fees(side: str, price: float, volume: int) -> float:
+    """Conservative fallback when broker fills omit explicit fees."""
+    amount = price * volume
+    commission_rate = (
+        COMMISSION_RATE if math.isfinite(COMMISSION_RATE)
+        and COMMISSION_RATE >= 0 else 0.0003
+    )
+    min_commission = (
+        MIN_COMMISSION if math.isfinite(MIN_COMMISSION)
+        and MIN_COMMISSION >= 0 else 5.0
+    )
+    transfer_rate = (
+        TRANSFER_FEE_RATE if math.isfinite(TRANSFER_FEE_RATE)
+        and TRANSFER_FEE_RATE >= 0 else 0.00001
+    )
+    stamp_rate = (
+        STAMP_DUTY_RATE if math.isfinite(STAMP_DUTY_RATE)
+        and STAMP_DUTY_RATE >= 0 else 0.0005
+    )
+    commission = max(min_commission, amount * commission_rate)
+    transfer = amount * transfer_rate
+    stamp = amount * stamp_rate if side == 'SELL' else 0.0
+    return commission + transfer + stamp
+
+
+def _fill_fees(fill: dict) -> float:
+    value = fill.get('fees')
+    if value is not None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = math.nan
+        # Older QMT builds and some broker adapters expose a zero placeholder
+        # before fees settle. Treat it as missing; otherwise daily net PnL is
+        # silently overstated.
+        if math.isfinite(parsed) and parsed > 0:
+            return parsed
+    return _estimated_fees(
+        str(fill.get('action', '')).upper(),
+        float(fill.get('price', 0)),
+        int(fill.get('volume', 0)),
+    )
 
 
 def load_trade_logs(date_str: str) -> list:
-    """加载指定日期的所有交易日志。"""
+    """Load broker-confirmed fills recorded on one trading date."""
+    date_str = _normalize_date_str(date_str)
     log_dir = os.path.join(TRADE_LOG_DIR, date_str)
     if not os.path.exists(log_dir):
         print(f'交易日志目录不存在: {log_dir}')
         return []
 
     logs = []
-    for filepath in sorted(glob.glob(os.path.join(log_dir, 'trade_*.json'))):
+    filepaths = sorted(
+        glob.glob(os.path.join(log_dir, 'trade_*.json'))
+        + glob.glob(os.path.join(log_dir, 'fill_*.json'))
+    )
+    for filepath in filepaths:
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
-                logs.append(json.load(f))
+                record = json.load(f)
+                if isinstance(record, dict):
+                    record = dict(record)
+                    record['_log_date'] = date_str
+                    logs.append(record)
         except Exception as e:
             print(f'读取文件失败 {filepath}: {e}')
-    return logs
+    # Both an explicit fill type and FILLED status are required.  Legacy
+    # "trade" files were order submissions and therefore cannot prove an
+    # execution unless they also carry the explicit broker status.
+    confirmed = []
+    for log in logs:
+        record_type = log.get('record_type')
+        execution_status = log.get('execution_status')
+        if (record_type in ('trade', 'fill')
+                and execution_status == 'FILLED'):
+            confirmed.append(log)
+    return confirmed
+
+
+def load_trade_ledger(date_str: str) -> list:
+    """Load all confirmed fills through ``date_str`` for FIFO inventory.
+
+    A-share exits normally occur on a later trading date than their buys.  A
+    single-day directory cannot reconstruct cost basis, so daily review uses
+    every prior fill while still reporting only the target day's realization.
+    """
+    target = _normalize_date_str(date_str)
+    if not os.path.isdir(TRADE_LOG_DIR):
+        return []
+
+    ledger = []
+    seen = set()
+    for entry in sorted(os.scandir(TRADE_LOG_DIR), key=lambda item: item.name):
+        if not entry.is_dir():
+            continue
+        try:
+            trade_date = _normalize_date_str(entry.name)
+        except ValueError:
+            continue
+        if trade_date > target:
+            continue
+        for fill in load_trade_logs(trade_date):
+            effective_date = _record_trade_date(fill) or trade_date
+            if effective_date > target:
+                continue
+            trade_id = str(fill.get('trade_id', '')).strip()
+            identity = (
+                effective_date,
+                str(fill.get('account_id', '')),
+                str(fill.get('strategy_name', '')),
+                trade_id,
+            )
+            if trade_id and identity in seen:
+                continue
+            if trade_id:
+                seen.add(identity)
+            ledger.append(fill)
+    return ledger
 
 
 def load_trade_events(date_str: str) -> list:
     """加载指定日期的所有结构化事件。"""
+    date_str = _normalize_date_str(date_str)
     log_dir = os.path.join(TRADE_LOG_DIR, date_str)
     filepath = os.path.join(log_dir, EVENT_LOG_FILENAME)
     if not os.path.exists(filepath):
@@ -67,95 +210,103 @@ def load_trade_events(date_str: str) -> list:
 
 
 def match_buy_sell_pairs(logs: list) -> list:
-    """匹配买卖配对。"""
-    buys = defaultdict(list)
-    sells = defaultdict(list)
-
-    for log in logs:
-        code = log.get('stock_code', '')
-        if log.get('action') == 'BUY':
-            buys[code].append(log)
-        elif log.get('action') == 'SELL':
-            sells[code].append(log)
-
+    """FIFO-match confirmed fills, including partial executions and fees."""
+    inventories = defaultdict(list)
     pairs = []
-    for code in set(list(buys.keys()) + list(sells.keys())):
-        buy_list = buys.get(code, [])
-        sell_list = sells.get(code, [])
+    ordered = sorted(logs, key=lambda item: (
+        _record_trade_date(item), str(item.get('timestamp', '')),
+        str(item.get('trade_id', ''))
+    ))
+    for fill in ordered:
+        code = str(fill.get('stock_code', ''))
+        side = str(fill.get('action', '')).upper()
+        if not code or side not in ('BUY', 'SELL'):
+            continue
+        try:
+            price = float(fill.get('price', 0))
+            volume = int(fill.get('volume', 0))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(price) or price <= 0 or volume <= 0:
+            continue
+        fee_per_share = _fill_fees(fill) / volume
+        if not math.isfinite(fee_per_share) or fee_per_share < 0:
+            continue
+        inventory_key = (
+            str(fill.get('account_id', '')),
+            str(fill.get('strategy_name', '')),
+            code,
+        )
+        if side == 'BUY':
+            inventories[inventory_key].append({
+                **fill, 'remaining': volume, 'fee_per_share': fee_per_share,
+            })
+            continue
+        remaining_sell = volume
+        sell_fee_per_share = fee_per_share
+        while remaining_sell > 0 and inventories[inventory_key]:
+            buy = inventories[inventory_key][0]
+            matched = min(remaining_sell, int(buy['remaining']))
+            buy_price = float(buy['price'])
+            gross = (price - buy_price) * matched
+            fees = (float(buy['fee_per_share']) + sell_fee_per_share) * matched
+            pnl_amount = gross - fees
+            cost = buy_price * matched + float(buy['fee_per_share']) * matched
+            pairs.append({
+                'stock_code': code, 'buy_price': buy_price,
+                'sell_price': price, 'volume': matched,
+                'pnl_pct': pnl_amount / cost * 100 if cost > 0 else None,
+                'pnl_amount': pnl_amount, 'fees': fees,
+                'buy_time': buy.get('timestamp', ''),
+                'sell_time': fill.get('timestamp', ''),
+                'buy_date': _record_trade_date(buy),
+                'sell_date': _record_trade_date(fill),
+                'account_id': fill.get('account_id', ''),
+                'strategy_name': fill.get('strategy_name', ''),
+                'buy_reason': buy.get('order_remark', ''),
+                'sell_trigger': fill.get('order_remark', ''),
+            })
+            buy['remaining'] -= matched
+            remaining_sell -= matched
+            if buy['remaining'] <= 0:
+                inventories[inventory_key].pop(0)
+        if remaining_sell > 0:
+            pairs.append({
+                'stock_code': code, 'buy_price': None, 'sell_price': price,
+                'volume': remaining_sell, 'pnl_pct': None, 'pnl_amount': None,
+                'buy_time': None, 'sell_time': fill.get('timestamp', ''),
+                'buy_date': None, 'sell_date': _record_trade_date(fill),
+                'account_id': fill.get('account_id', ''),
+                'strategy_name': fill.get('strategy_name', ''),
+                'buy_reason': '', 'sell_trigger': fill.get('order_remark', ''),
+                'status': '期初持仓或缺失买入成交',
+            })
+    for (account_id, strategy_name, code), lots in inventories.items():
+        for buy in lots:
+            pairs.append({
+                'stock_code': code, 'buy_price': float(buy['price']),
+                'sell_price': None, 'volume': int(buy['remaining']),
+                'pnl_pct': None, 'pnl_amount': None,
+                'buy_time': buy.get('timestamp', ''), 'sell_time': None,
+                'buy_date': _record_trade_date(buy), 'sell_date': None,
+                'account_id': account_id, 'strategy_name': strategy_name,
+                'buy_reason': buy.get('order_remark', ''), 'sell_trigger': '',
+                'status': '未平仓',
+            })
+    return sorted(pairs, key=lambda item: (
+        item.get('pnl_amount') is None,
+        str(item.get('sell_time') or item.get('buy_time') or ''),
+        str(item.get('stock_code', '')),
+    ))
 
-        if buy_list and sell_list:
-            for i, buy in enumerate(buy_list):
-                if i < len(sell_list):
-                    sell = sell_list[i]
-                    buy_price = float(buy.get('price', 0))
-                    sell_price = float(sell.get('price', 0))
-                    buy_volume = int(buy.get('volume', 0))
-                    sell_volume = int(sell.get('volume', buy_volume))
-                    matched_volume = min(buy_volume, sell_volume) if sell_volume > 0 else buy_volume
-                    if buy_price > 0 and sell_price > 0:
-                        pnl_pct = (sell_price - buy_price) / buy_price * 100
-                        pnl_amount = (sell_price - buy_price) * matched_volume
-                    else:
-                        pnl_pct = None
-                        pnl_amount = None
-                    pairs.append({
-                        'stock_code': code,
-                        'buy_price': buy_price,
-                        'sell_price': sell_price,
-                        'volume': matched_volume,
-                        'pnl_pct': pnl_pct,
-                        'pnl_amount': pnl_amount,
-                        'buy_time': buy.get('timestamp', ''),
-                        'sell_time': sell.get('timestamp', ''),
-                        'buy_reason': buy.get('buy_reason', ''),
-                        'sell_trigger': sell.get('sell_trigger', ''),
-                    })
-                else:
-                    pairs.append({
-                        'stock_code': code,
-                        'buy_price': float(buy.get('price', 0)),
-                        'sell_price': None,
-                        'volume': int(buy.get('volume', 0)),
-                        'pnl_pct': None,
-                        'pnl_amount': None,
-                        'buy_time': buy.get('timestamp', ''),
-                        'sell_time': None,
-                        'buy_reason': buy.get('buy_reason', ''),
-                        'sell_trigger': '',
-                        'status': '未平仓',
-                    })
-        elif buy_list:
-            for buy in buy_list:
-                pairs.append({
-                    'stock_code': code,
-                    'buy_price': float(buy.get('price', 0)),
-                    'sell_price': None,
-                    'volume': int(buy.get('volume', 0)),
-                    'pnl_pct': None,
-                    'pnl_amount': None,
-                    'buy_time': buy.get('timestamp', ''),
-                    'sell_time': None,
-                    'buy_reason': buy.get('buy_reason', ''),
-                    'sell_trigger': '',
-                    'status': '未平仓',
-                })
-        elif sell_list:
-            for sell in sell_list:
-                pairs.append({
-                    'stock_code': code,
-                    'buy_price': None,
-                    'sell_price': float(sell.get('price', 0)),
-                    'volume': int(sell.get('volume', 0)),
-                    'pnl_pct': None,
-                    'pnl_amount': None,
-                    'buy_time': None,
-                    'sell_time': sell.get('timestamp', ''),
-                    'buy_reason': '',
-                    'sell_trigger': sell.get('sell_trigger', ''),
-                    'status': '盘前持仓卖出',
-                })
 
-    return pairs
+def select_daily_pairs(pairs: list, date_str: str) -> list:
+    """Keep exits realized on the report date and inventory still open."""
+    date_str = _normalize_date_str(date_str)
+    return [
+        pair for pair in pairs
+        if pair.get('sell_price') is None or pair.get('sell_date') == date_str
+    ]
 
 
 def build_event_summary(events: list) -> dict:
@@ -172,6 +323,7 @@ def build_event_summary(events: list) -> dict:
         'break_episode_end': 0,
         'limit_up': 0,
         'order_submitted': 0,
+        'trade_filled': 0,
         'buy_types': defaultdict(int),
         'sell_remarks': defaultdict(int),
     }
@@ -254,6 +406,7 @@ def generate_report(date_str: str, logs: list, events: list, pairs: list) -> str
     lines.append(f'| 涨停事件 | {event_summary["limit_up"]} |')
     lines.append(f'| 买入决策 | {event_summary["buy_decision"]} |')
     lines.append(f'| 发单事件 | {event_summary["order_submitted"]} |')
+    lines.append(f'| 真实成交回报 | {event_summary["trade_filled"]} |')
     lines.append(f'| 撤单决策 | {event_summary["cancel_decision"]} |')
     lines.append(f'| 卖出决策 | {event_summary["sell_decision"]} |')
     lines.append(f'| 观察名单加入 | {event_summary["watchlist_enter"]} |')
@@ -305,20 +458,23 @@ def main():
     parser.add_argument('--date', type=str, default=date.today().strftime('%Y%m%d'),
                         help='复盘日期，格式 YYYYMMDD')
     args = parser.parse_args()
-    date_str = args.date
+    date_str = _normalize_date_str(args.date)
 
     print(f'正在复盘 {date_str} ...')
 
     logs = load_trade_logs(date_str)
     events = load_trade_events(date_str)
-    if not logs and not events:
-        print(f'{date_str} 无交易日志和事件日志，跳过复盘')
+    # Match against the complete fill ledger through the target date.  Only
+    # loading today's fills would lose the cost basis of normal T+1 exits.
+    ledger = load_trade_ledger(date_str)
+    pairs = select_daily_pairs(match_buy_sell_pairs(ledger), date_str)
+    if not logs and not events and not pairs:
+        print(f'{date_str} 无当日活动或未平仓成交，跳过复盘')
         return
 
-    print(f'加载了 {len(logs)} 条交易记录')
+    print(f'加载了 {len(logs)} 条当日成交记录')
+    print(f'加载了 {len(ledger)} 条截至当日成交账本记录')
     print(f'加载了 {len(events)} 条事件记录')
-
-    pairs = match_buy_sell_pairs(logs)
     print(f'匹配了 {len(pairs)} 笔交易（含未平仓）')
 
     report = generate_report(date_str, logs, events, pairs)

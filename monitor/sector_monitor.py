@@ -10,6 +10,7 @@ monitor/sector_monitor.py - 板块监控模块
 - ths_monitor_task: 同花顺数据监控任务
 """
 
+import math
 import time
 import traceback
 from functools import partial
@@ -370,20 +371,48 @@ def ths_monitor_task(shared_data):
         yesterday_limit_up_stocks = shared_data['昨日涨停股票']
 
         # 获取最新tick
-        data = xtdata.get_full_tick(
-            list(
-                set(yesterday_limit_up_stocks)
-                | set(yesterday_first_limit_up_stocks)))
-        data = pd.DataFrame(data).T.reset_index(names='股票代码')
-        data['涨跌幅'] = (data['lastPrice'] -
-                       data['lastClose']) / data['lastClose'] * 100
+        requested_codes = list(
+            set(yesterday_limit_up_stocks)
+            | set(yesterday_first_limit_up_stocks))
+        if not requested_codes:
+            logger.warning('昨日涨停样本为空，不刷新昨日表现时间戳')
+            return
+        raw_ticks = xtdata.get_full_tick(requested_codes)
+        if not raw_ticks:
+            logger.warning('昨日涨停行情为空，不刷新昨日表现时间戳')
+            return
+        data = pd.DataFrame(raw_ticks).T.reset_index(names='股票代码')
+        required_columns = {'股票代码', 'lastPrice', 'lastClose'}
+        if not required_columns.issubset(data.columns):
+            logger.warning('昨日涨停行情字段不完整，不刷新昨日表现时间戳')
+            return
+        last_price = pd.to_numeric(data['lastPrice'], errors='coerce')
+        last_close = pd.to_numeric(data['lastClose'], errors='coerce')
+        valid = (
+            last_price.map(math.isfinite)
+            & last_close.map(math.isfinite)
+            & last_price.ge(0)
+            & last_close.gt(0)
+        )
+        data = data.loc[valid].copy()
+        if data.empty:
+            logger.warning('昨日涨停行情没有有效价格，不刷新昨日表现时间戳')
+            return
+        data['涨跌幅'] = (last_price[valid] - last_close[valid]) / last_close[valid] * 100
+        first_performance = data[data['股票代码'].isin(
+            yesterday_first_limit_up_stocks)]['涨跌幅'].mean()
+        limit_performance = data[data['股票代码'].isin(
+            yesterday_limit_up_stocks)]['涨跌幅'].mean()
+        # The score averages both lanes. Missing either lane would publish NaN
+        # and then refresh freshness, so fail closed until both are observable.
+        if not (pd.notna(first_performance) and pd.notna(limit_performance)):
+            logger.warning('昨日首板或涨停表现样本缺失，不刷新昨日表现时间戳')
+            return
 
         with shared_data['市场情绪_昨日首板表现'].get_lock():
-            shared_data['市场情绪_昨日首板表现'].value = data[data['股票代码'].isin(
-                yesterday_first_limit_up_stocks)]['涨跌幅'].mean()
+            shared_data['市场情绪_昨日首板表现'].value = first_performance
         with shared_data['市场情绪_昨日涨停表现'].get_lock():
-            shared_data['市场情绪_昨日涨停表现'].value = data[data['股票代码'].isin(
-                yesterday_limit_up_stocks)]['涨跌幅'].mean()
+            shared_data['市场情绪_昨日涨停表现'].value = limit_performance
 
         # 更新昨日涨停表现数据更新时间
         with shared_data['昨日涨停表现更新时间'].get_lock():

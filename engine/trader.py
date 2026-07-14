@@ -31,10 +31,22 @@ from infra.utils import send_email
 from infra.trade_log import save_trade_log
 from infra.data_helpers import _check_same_price
 from engine.xt_queries import (
+    cache_local_buy_reservation, run_with_effective_orders_locked,
     query_stock_asset, query_stock_positions, query_stock_orders,
     query_positions_and_orders, query_positions_and_orders_task,
 )
 from core.trailing_stop import calculate_trailing_stop_prices
+from core.market_microstructure import (
+    build_local_buy_reservation, exposure_slot_count,
+)
+
+
+def _accepted_order_id(order_id):
+    """Return whether XTQuant synchronously accepted an order request."""
+    try:
+        return int(order_id) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 # ---------------------------------------------------------------------------- #
@@ -87,7 +99,9 @@ def run_xt_trader_task(order_queue, shared_data):
     cancelled_order_id_list = []
 
     try:
-        xt_trader, acc = get_trader_entity(logger, CLIENT_PATH, STOCK_ACCOUNT)
+        xt_trader, acc = get_trader_entity(
+            logger, CLIENT_PATH, STOCK_ACCOUNT, STRATEGY_NAME
+        )
         if xt_trader is None:
             # ----------------------------------- 记录日志 ----------------------------------- #
             timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -221,6 +235,10 @@ def run_xt_trader_task(order_queue, shared_data):
                     logger.warning(
                         f'[股价过高] 可用资金不足以购买100股, 股票代码：{stock_code}, 价格：{order_price}, 可用资金: {available_cash}, 最小持仓金额: {min_holding_amount}, 每只股票最大持仓金额: {holding_amount_threshold}'
                     )
+                    stock_status = shared_data['股票状态信号'][stock_code]
+                    with stock_status['下单状态'].get_lock():
+                        stock_status[
+                            '下单状态'].value = StockOrderStatusInt.NOT_ORDERED
                     continue
 
                 logger.debug(f'可用资金: {available_cash}')
@@ -231,18 +249,16 @@ def run_xt_trader_task(order_queue, shared_data):
                     logger.warning(
                         f'[跳过购买] 当前股票已持仓: {stock_code}, 持仓信息: {positions[stock_code]}'
                     )
+                    stock_status = shared_data['股票状态信号'][stock_code]
+                    with stock_status['下单状态'].get_lock():
+                        stock_status[
+                            '下单状态'].value = StockOrderStatusInt.POSITION_HOLDING
                     continue
 
                 # ---------------------------- 查询当日所有的持仓和委托 ---------------------------- #
                 orders = query_stock_orders(xt_trader,
                                             acc,
                                             cancelable_only=True)
-                if stock_code in orders:
-                    logger.warning(
-                        f'[跳过购买] 当前股票已委托: {stock_code}, 委托信息: {orders[stock_code]}'
-                    )
-                    continue
-
                 # ---------------------------------- 计算买入数量 ---------------------------------- #
                 amount_threshold = min(
                     max(holding_amount_threshold, min_holding_amount),
@@ -272,18 +288,77 @@ def run_xt_trader_task(order_queue, shared_data):
                 order_volume = min(order_volume, max_affordable_volume)
                 if order_volume <= 0:
                     logger.warning(f'[跳过购买] 计算后买入数量为0: {stock_code}')
+                    stock_status = shared_data['股票状态信号'][stock_code]
+                    with stock_status['下单状态'].get_lock():
+                        stock_status[
+                            '下单状态'].value = StockOrderStatusInt.NOT_ORDERED
                     continue
 
-                # ------------------------------------ 下单 ------------------------------------ #
-                order_id = xt_trader.order_stock(
-                    account=acc,
-                    stock_code=order_req["股票代码"],
-                    order_type=xtconstant.STOCK_BUY,
-                    order_volume=order_volume,
-                    price_type=order_req['报价类型'],
-                    price=order_req['委托价格'],
-                    strategy_name=order_req['策略名称'],
-                    order_remark=order_req['委托备注'])
+                # review 20260714: hold one process-local lock from the final
+                # exposure check through broker acceptance and reservation.
+                # This closes the refresh/submission race while worker signals
+                # continue to arrive through the single executor queue.
+                def submit_buy(effective_orders):
+                    if stock_code in effective_orders:
+                        return 'duplicate', effective_orders[stock_code]
+                    if exposure_slot_count(
+                            positions, effective_orders) >= MAX_HOLDING_COUNT:
+                        return 'capacity', None
+                    broker_order_id = xt_trader.order_stock(
+                        account=acc,
+                        stock_code=order_req["股票代码"],
+                        order_type=xtconstant.STOCK_BUY,
+                        order_volume=order_volume,
+                        price_type=order_req['报价类型'],
+                        price=order_req['委托价格'],
+                        strategy_name=order_req['策略名称'],
+                        order_remark=order_req['委托备注'])
+                    if not _accepted_order_id(broker_order_id):
+                        return 'rejected', broker_order_id
+                    cache_local_buy_reservation(
+                        shared_data,
+                        stock_code,
+                        build_local_buy_reservation(
+                            stock_code,
+                            broker_order_id,
+                            委托价格=order_req['委托价格'],
+                            委托数量=order_volume,
+                            策略名称=order_req['策略名称'],
+                        ),
+                    )
+                    return 'accepted', broker_order_id
+
+                submission_status, submission_detail = (
+                    run_with_effective_orders_locked(
+                        shared_data, orders, submit_buy
+                    )
+                )
+                if submission_status == 'duplicate':
+                    logger.warning(
+                        f'[跳过购买] 当前股票已有券商委托或本地预占: '
+                        f'{stock_code}, 委托信息: {submission_detail}'
+                    )
+                    continue
+                if submission_status == 'capacity':
+                    logger.warning(
+                        f'[跳过购买] 持仓及待成交买单已达 '
+                        f'{MAX_HOLDING_COUNT} 个: {stock_code}'
+                    )
+                    stock_status = shared_data['股票状态信号'][stock_code]
+                    with stock_status['下单状态'].get_lock():
+                        stock_status[
+                            '下单状态'].value = StockOrderStatusInt.NOT_ORDERED
+                    continue
+                if submission_status == 'rejected':
+                    logger.error(
+                        f'[委托买入失败] {stock_code} 柜台未返回有效订单编号: '
+                        f'{submission_detail!r}')
+                    stock_status = shared_data['股票状态信号'][stock_code]
+                    with stock_status['下单状态'].get_lock():
+                        stock_status[
+                            '下单状态'].value = StockOrderStatusInt.NOT_ORDERED
+                    continue
+                order_id = submission_detail
 
                 # ----------------------------------- 记录日志 ----------------------------------- #
                 timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -300,6 +375,7 @@ def run_xt_trader_task(order_queue, shared_data):
                     'volume': order_volume,
                     'timestamp': timestamp_now,
                     'order_id': order_id,
+                    'strategy_name': order_req['策略名称'],
                     'buy_reason': order_req.get('操作原因', ''),
                     'market_sentiment': shared_data['市场情绪_评分'].value if hasattr(shared_data.get('市场情绪_评分'), 'value') else 0,
                 })
@@ -341,6 +417,19 @@ def run_xt_trader_task(order_queue, shared_data):
                         price=0,
                         strategy_name=order_req['策略名称'],
                         order_remark=order_req['委托备注'])
+                if not _accepted_order_id(order_id):
+                    # review 20260714: a rejected exit is still an open risk.
+                    # Do not emit a fictitious SELL trade that can corrupt the
+                    # daily PnL pairing; leave the holding eligible for retry.
+                    logger.error(
+                        f'[委托卖出失败] {stock_code} 柜台未返回有效订单编号: '
+                        f'{order_id!r}')
+                    send_email(
+                        f'【委托卖出失败】股票代码: {stock_code}',
+                        f'柜台未返回有效订单编号: {order_id!r}; '
+                        f'原因: {order_req.get("操作原因", "")}',
+                    )
+                    continue
 
                 # ----------------------------------- 记录日志 ----------------------------------- #
                 timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -357,6 +446,7 @@ def run_xt_trader_task(order_queue, shared_data):
                     'volume': sell_volume,
                     'timestamp': timestamp_now,
                     'order_id': order_id,
+                    'strategy_name': order_req['策略名称'],
                     'sell_trigger': order_req.get('操作原因', ''),
                     'market_sentiment': shared_data['市场情绪_评分'].value if hasattr(shared_data.get('市场情绪_评分'), 'value') else 0,
                 })
@@ -371,6 +461,9 @@ def run_xt_trader_task(order_queue, shared_data):
                                                        cancelable_only=True)
                 if stock_code not in orders_can_cancel:
                     logger.warning(f'[撤单失败] 当前无可撤单委托: {order_req["股票代码"]}')
+                    # Do not mark the local reservation as cancelled: QMT may
+                    # still be acknowledging a real accepted order.  Keeping
+                    # it allows a later Tick to retry once the order is visible.
                     continue
 
                 # ------------------------------------ 撤单 ------------------------------------ #
@@ -398,7 +491,11 @@ def run_xt_trader_task(order_queue, shared_data):
                         'SH') else xtconstant.SZ_MARKET
                     cancel_result = xt_trader.cancel_order_stock_sysid(
                         acc, market, order['柜台合同编号'])
-                    if cancel_result == -1:
+                    try:
+                        cancel_accepted = int(cancel_result) >= 0
+                    except (TypeError, ValueError):
+                        cancel_accepted = False
+                    if not cancel_accepted:
                         logger.error(f'[撤单失败]: {order}')
                         send_email(f'【撤单失败】股票代码: {order_req["股票代码"]}',
                                    f'撤单失败, 订单信息: {order}')

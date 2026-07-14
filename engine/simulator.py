@@ -28,6 +28,9 @@ from config import (
 from engine.paper_broker import BrokerConfig, Fill, PaperBroker
 from engine.queue_fill import queued_buy_fill_progress
 from infra.common_enums import OrderType, StockOrderStatusInt
+from core.market_microstructure import (
+    exposure_slot_count, is_sealed_limit_up_quote,
+)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -219,6 +222,11 @@ def execute_paper_order(
     if order_type == OrderType.BUY and order_req.get("买入类型") == "排板":
         if stock_code in broker.positions or stock_code in pending:
             return None
+        # review 20260714: pending buys consume exposure too; otherwise several
+        # worker signals can exceed the documented maximum holding count.
+        if exposure_slot_count(shared_data["持仓状态"], pending) >= MAX_HOLDING_COUNT:
+            _set_status(shared_data, stock_code, StockOrderStatusInt.NOT_ORDERED)
+            return None
         quantity = _requested_buy_quantity(
             broker, order_req, shared_data, shadow_signal_mode
         )
@@ -259,6 +267,12 @@ def execute_paper_order(
         return None
 
     if order_type == OrderType.BUY:
+        if (stock_code not in broker.positions
+                and order_req.get("买入类型") != "模拟成交"
+                and exposure_slot_count(shared_data["持仓状态"], pending)
+                >= MAX_HOLDING_COUNT):
+            _set_status(shared_data, stock_code, StockOrderStatusInt.NOT_ORDERED)
+            return None
         execution_tick = tick
         if order_req.get("买入类型") == "模拟成交":
             encoded = pending.get(stock_code)
@@ -269,20 +283,10 @@ def execute_paper_order(
             limit_price = float(pending_order["委托价格"])
             reason = str(pending_order.get("操作原因", reason))
             signal_id = str(pending_order.get("signal_id", signal_id))
-            last_price = float(tick.get("lastPrice", 0) or 0)
-            bid_prices = tick.get("bidPrice") or []
-            ask_prices = tick.get("askPrice") or []
-            bid_price = float(bid_prices[0] or 0) if bid_prices else 0.0
-            ask_price = float(ask_prices[0] or 0) if ask_prices else 0.0
             # A queue fill must still be observed on a sealed limit-up book.
             # Merely trading at the limit price after the ask queue reappears
             # is an opened board and cannot prove our bid was reached.
-            is_limit_up = (
-                limit_price > 0
-                and abs(last_price - limit_price) < 0.0001
-                and abs(bid_price - limit_price) < 0.0001
-                and ask_price <= 0
-            )
+            is_limit_up = is_sealed_limit_up_quote(tick, limit_price, tolerance=0.0001)
             progress = queued_buy_fill_progress(
                 pending_order, tick, is_limit_up=is_limit_up
             )

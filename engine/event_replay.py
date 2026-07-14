@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from data.tick_archive import TickBatch
-from engine.backtest import BacktestSignal, _is_limit_up_tick
+from core.market_microstructure import is_sealed_limit_up_quote
+from engine.backtest import BacktestSignal, _limit_up_price_for_entry
 from engine.paper_broker import PaperBroker
 from engine.queue_fill import queued_buy_fill_progress
 
@@ -180,6 +181,9 @@ class EventLogReplayStrategy:
         self.cancelled_queue_count = 0
         self.duplicate_queue_event_count = 0
         self.last_trade_date = ""
+        self.used_received_time_batches = 0
+        self.event_time_fallback_batches = 0
+        self.stale_event_count = 0
 
     @staticmethod
     def _signal_id(event: ReplayEvent) -> str:
@@ -196,8 +200,11 @@ class EventLogReplayStrategy:
         trade_date: str,
     ) -> None:
         bid_volume = float(_first(tick.get("bidVol")) or 0)
-        limit_price = float(tick.get("lastPrice", 0) or 0)
-        if limit_price <= 0 or not _is_limit_up_tick(tick):
+        limit_price = _limit_up_price_for_entry(tick)
+        if (
+            limit_price is None
+            or not is_sealed_limit_up_quote(tick, limit_price)
+        ):
             self.expired_queue_count += 1
             return
         quantity = (
@@ -230,7 +237,7 @@ class EventLogReplayStrategy:
             tick = batch.ticks.get(stock_code)
             if tick is None:
                 continue
-            if not _is_limit_up_tick(tick):
+            if not is_sealed_limit_up_quote(tick, pending["limit_price"]):
                 self.pending_queues.pop(stock_code, None)
                 self.expired_queue_count += 1
                 continue
@@ -256,30 +263,38 @@ class EventLogReplayStrategy:
             self.pending_queues.pop(stock_code, None)
         return signals
 
-    def on_tick_batch(
-        self, batch: TickBatch, broker: PaperBroker
-    ) -> Iterable[BacktestSignal]:
-        if self.last_trade_date and batch.trade_date != self.last_trade_date:
-            self.expired_queue_count += len(self.pending_queues)
-            self.pending_queues.clear()
-        self.last_trade_date = batch.trade_date
-        signals = self._advance_queues(batch)
-        cutoff = batch.event_time_ms
-        upper = bisect_right(self.timestamps, cutoff, lo=self.cursor)
-        for event in self.events[self.cursor:upper]:
+    def _consume_events(
+        self,
+        events: Iterable[ReplayEvent],
+        batch: TickBatch,
+        broker: PaperBroker,
+        *,
+        execute_on_current_tick: bool,
+    ) -> list[BacktestSignal]:
+        signals: list[BacktestSignal] = []
+        for event in events:
             if event.event_type == "cancel_decision":
                 if self.pending_queues.pop(event.stock_code, None) is not None:
                     self.cancelled_queue_count += 1
             elif event.event_type == "buy_decision":
                 if event.buy_type == "排板":
                     snapshot = dict((event.raw or {}).get("snapshot") or {})
+                    event_limit = (event.raw or {}).get("limit_up_price")
+                    if (
+                        event_limit is not None
+                        and "limitUpPrice" not in snapshot
+                        and "upperLimitPrice" not in snapshot
+                    ):
+                        snapshot["limitUpPrice"] = event_limit
                     if not snapshot:
                         self.expired_queue_count += 1
                     else:
-                        self._queue_signal(
-                            event, snapshot, broker, batch.trade_date
-                        )
+                        self._queue_signal(event, snapshot, broker, batch.trade_date)
                 else:
+                    can_execute_now = (
+                        execute_on_current_tick
+                        and event.stock_code in batch.ticks
+                    )
                     signals.append(
                         BacktestSignal(
                             stock_code=event.stock_code,
@@ -287,12 +302,15 @@ class EventLogReplayStrategy:
                             target_value=self.buy_target_value,
                             reason=event.reason,
                             signal_id=self._signal_id(event),
-                            limit_up_entry=bool(
-                                event.buy_type in {"排板", "扫板"}
-                            ),
+                            limit_up_entry=True,
+                            execute_on_current_tick=can_execute_now,
                         )
                     )
             else:
+                can_execute_now = (
+                    execute_on_current_tick
+                    and event.stock_code in batch.ticks
+                )
                 signals.append(
                     BacktestSignal(
                         stock_code=event.stock_code,
@@ -300,8 +318,91 @@ class EventLogReplayStrategy:
                         target_remaining=event.target_remaining,
                         reason=event.reason,
                         signal_id=self._signal_id(event),
+                        execute_on_current_tick=can_execute_now,
                     )
                 )
+        return signals
+
+    def on_tick_batch(
+        self, batch: TickBatch, broker: PaperBroker
+    ) -> Iterable[BacktestSignal]:
+        if self.last_trade_date and batch.trade_date != self.last_trade_date:
+            self.expired_queue_count += len(self.pending_queues)
+            self.pending_queues.clear()
+        self.last_trade_date = batch.trade_date
+        # Decision logs use local wall-clock time.  Align them to the archive's
+        # callback receipt clock, not the exchange quote clock; otherwise clock
+        # skew can release a decision against a quote that arrived before the
+        # decision actually existed.  Legacy/synthetic archives fall back to the
+        # exchange timestamp and expose that weaker mode in diagnostics.
+        receipt_cutoff = batch.received_time_ms
+        # Synthetic/legacy archives may be written long after the historical
+        # quote.  A receipt clock modestly *after* exchange time is plausible
+        # callback latency; a much later one is probably synthetic and falls
+        # back.  Conversely, an exchange timestamp may be arbitrarily ahead of
+        # the local clock: falling back in that direction would release future
+        # decisions before the callback was actually received (lookahead).
+        receipt_trade_date = (
+            datetime.fromtimestamp(receipt_cutoff / 1000, CHINA_TZ).strftime(
+                "%Y%m%d"
+            )
+            if receipt_cutoff > 0
+            else ""
+        )
+        receipt_is_aligned = (
+            receipt_cutoff > 0
+            and batch.event_time_ms > 0
+            and receipt_trade_date == batch.trade_date
+            and receipt_cutoff - batch.event_time_ms <= 60_000
+        )
+        if receipt_is_aligned:
+            cutoff = receipt_cutoff
+            self.used_received_time_batches += 1
+        else:
+            cutoff = batch.event_time_ms
+            self.event_time_fallback_batches += 1
+        # A receipt timestamp truncated to milliseconds cannot prove whether an
+        # event with the same millisecond happened before or after the callback.
+        # In receipt-clock mode require a strict ordering; fallback mode still
+        # queues equality for the engine's normal next-Tick execution.
+        upper = (
+            bisect_left(self.timestamps, cutoff, lo=self.cursor)
+            if receipt_is_aligned
+            else bisect_right(self.timestamps, cutoff, lo=self.cursor)
+        )
+        released = self.events[self.cursor:upper]
+        current_events: list[ReplayEvent] = []
+        for event in released:
+            event_trade_date = datetime.fromtimestamp(
+                event.timestamp_ms / 1000, CHINA_TZ
+            ).strftime("%Y%m%d")
+            if event_trade_date < batch.trade_date:
+                # A decision that never saw another same-day quote is expired,
+                # not an order that may be filled at tomorrow's opening price.
+                self.stale_event_count += 1
+            elif event_trade_date == batch.trade_date:
+                current_events.append(event)
+            else:
+                raise ValueError(
+                    "event timestamp is later than Tick archive trade_date: "
+                    f"{event_trade_date} > {batch.trade_date}"
+                )
+        if receipt_is_aligned:
+            # These decisions were logged before this callback arrived.  Apply
+            # cancels/new queue orders first, then let this first subsequent
+            # quote provide execution evidence.  Sweep/sell signals may execute
+            # on it because it is already the next Tick after the decision.
+            signals = self._consume_events(
+                current_events, batch, broker, execute_on_current_tick=True
+            )
+            signals.extend(self._advance_queues(batch))
+        else:
+            # Exchange-time fallback cannot prove the event preceded this same
+            # quote, so retain the conservative next-Tick ordering.
+            signals = self._advance_queues(batch)
+            signals.extend(self._consume_events(
+                current_events, batch, broker, execute_on_current_tick=False
+            ))
         self.cursor = upper
         return signals
 
@@ -313,4 +414,7 @@ class EventLogReplayStrategy:
             "expired_queue_count": self.expired_queue_count,
             "cancelled_queue_count": self.cancelled_queue_count,
             "duplicate_queue_event_count": self.duplicate_queue_event_count,
+            "received_time_alignment_batches": self.used_received_time_batches,
+            "event_time_fallback_batches": self.event_time_fallback_batches,
+            "stale_event_count": self.stale_event_count,
         }

@@ -22,6 +22,7 @@ from data.tick_archive import (
     verify_tick_archive,
 )
 from engine.paper_broker import BrokerConfig, Fill, PaperBroker
+from core.market_microstructure import is_sealed_limit_up_quote
 
 
 @dataclass(frozen=True)
@@ -107,31 +108,16 @@ def wilson_interval(
     }
 
 
-def _is_limit_up_tick(tick: Mapping[str, Any]) -> bool:
-    """Infer a sealed board from the quote without future information.
-
-    At a sealed limit-up, best ask is empty and the best bid equals last price.
-    The strategy can optionally provide ``limitUpPrice``/``upperLimitPrice`` in
-    archived ticks for an exact price check.  Otherwise the empty-ask condition
-    keeps this metric conservative and separate from ordinary successful trades.
-    """
-    last_price = float(tick.get("lastPrice", 0) or 0)
-    bid_price = float(_first_book_value(tick.get("bidPrice")) or 0)
-    ask_price = float(_first_book_value(tick.get("askPrice")) or 0)
-    limit_price = float(
-        tick.get("limitUpPrice", tick.get("upperLimitPrice", 0)) or 0
-    )
-    if last_price <= 0 or bid_price <= 0 or ask_price > 0:
-        return False
-    if abs(bid_price - last_price) > 0.001:
-        return False
-    return limit_price <= 0 or abs(bid_price - limit_price) <= 0.001
-
-
-def _first_book_value(value: Any) -> Any:
-    if isinstance(value, (list, tuple)):
-        return value[0] if value else 0
-    return value
+def _limit_up_price_for_entry(
+    tick: Mapping[str, Any], fallback: float | None = None
+) -> float | None:
+    """Return a known daily limit; never infer it from an arbitrary last trade."""
+    raw = tick.get("limitUpPrice", tick.get("upperLimitPrice", fallback))
+    try:
+        price = float(raw or 0)
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
 
 
 def calculate_performance(
@@ -139,6 +125,7 @@ def calculate_performance(
     equity_curve: list[dict[str, Any]],
     *,
     total_batches: int = 0,
+    drawdown_equities: Iterable[float] | None = None,
 ) -> dict[str, Any]:
     """Calculate fee-inclusive metrics without assuming a fixed bar interval."""
     final_snapshot = broker.snapshot(
@@ -153,6 +140,9 @@ def calculate_performance(
     equities.extend(float(point["equity"]) for point in equity_curve)
     if equities[-1] != float(final_snapshot["equity"]):
         equities.append(float(final_snapshot["equity"]))
+    risk_equities = list(drawdown_equities or equities)
+    if not risk_equities:
+        risk_equities = equities
     period_returns = [
         current / previous - 1
         for previous, current in zip(equities, equities[1:])
@@ -182,7 +172,9 @@ def calculate_performance(
         "total_return": final_snapshot["total_return"],
         "realized_pnl": final_snapshot["realized_pnl"],
         "unrealized_pnl": final_snapshot["unrealized_pnl"],
-        "maximum_drawdown": round(_maximum_drawdown(equities), 8),
+        # Drawdown is calculated from every replayed batch.  The published
+        # equity curve may be down-sampled for file size, but risk must not be.
+        "maximum_drawdown": round(_maximum_drawdown(risk_equities), 8),
         "closed_trade_count": len(closed),
         "win_count": len(winners),
         "loss_count": len(losers),
@@ -290,20 +282,65 @@ class BacktestEngine:
         limit_up_entries: list[dict[str, Any]] = []
         pending_signals: list[tuple[str, BacktestSignal]] = []
         expired_signal_count = 0
+        signal_count = 0
+        execution_attempt_count = 0
+        strategy_fill_count = 0
+        end_liquidation_attempt_count = 0
+        end_liquidation_fill_count = 0
+        risk_equities = [self.broker_config.initial_cash]
         current_trade_date = ""
         paths = discover_tick_files(tick_paths)
         if not paths:
             raise ValueError("no Tick archive files found")
         if self.config.validate_archives:
             invalid = []
+            archive_ranges: list[tuple[str, int, int, Path]] = []
+            session_segments: dict[tuple[str, str], Path] = {}
             for path in paths:
                 quality = verify_tick_archive(path)
                 if not quality["valid"]:
                     invalid.append(f"{path}: {quality}")
+                    continue
+                first_ns = int(quality.get("first_received_at_ns") or 0)
+                last_ns = int(quality.get("last_received_at_ns") or 0)
+                trade_date = str(quality.get("trade_date") or "")
+                session_id = str(quality.get("session_id") or "")
+                if (
+                    len(trade_date) != 8
+                    or not trade_date.isdigit()
+                    or not session_id
+                    or first_ns <= 0
+                    or last_ns < first_ns
+                ):
+                    invalid.append(f"{path}: invalid callback receipt-time range")
+                else:
+                    session_key = (trade_date, session_id)
+                    previous_path = session_segments.get(session_key)
+                    if previous_path is not None:
+                        invalid.append(
+                            f"{path}: duplicate archive session {session_id!r} "
+                            f"for {trade_date}; already used by {previous_path}"
+                        )
+                        continue
+                    session_segments[session_key] = path
+                    archive_ranges.append((trade_date, first_ns, last_ns, path))
             if invalid:
                 raise ValueError(
                     "Tick archive failed integrity checks:\n" + "\n".join(invalid)
                 )
+            # Receipt clocks order reconnect segments within one trading day.
+            # Trading dates remain the primary order because synthetic archives
+            # and captures copied between hosts need not share one wall clock.
+            archive_ranges.sort(key=lambda item: (item[0], item[1], str(item[3])))
+            for previous, current in zip(archive_ranges, archive_ranges[1:]):
+                if current[0] == previous[0] and current[1] <= previous[2]:
+                    raise ValueError(
+                        "Tick archive segments overlap or are globally out of order: "
+                        f"{previous[3]} ({previous[1]}-{previous[2]}) -> "
+                        f"{current[3]} ({current[1]}-{current[2]})"
+                    )
+            # Replay in callback-arrival order, independent of directory names.
+            paths = [item[3] for item in archive_ranges]
         with PaperBroker(
             self.broker_config,
             database_path=self.database_path,
@@ -311,6 +348,38 @@ class BacktestEngine:
             reset=True,
         ) as broker:
             curve.append(broker.snapshot(0))
+
+            def execute_and_record(
+                signal: BacktestSignal, batch: TickBatch
+            ) -> Fill | None:
+                nonlocal execution_attempt_count, strategy_fill_count
+                execution_attempt_count += 1
+                fill = self._execute(signal, batch, broker)
+                if not fill:
+                    return None
+                strategy_fill_count += 1
+                fills.append(asdict(fill))
+                if fill.side == "BUY" and signal.limit_up_entry:
+                    entry_tick = batch.ticks[fill.stock_code]
+                    limit_price = _limit_up_price_for_entry(
+                        entry_tick, signal.limit_price
+                    )
+                    is_sealed = bool(
+                        limit_price is not None
+                        and is_sealed_limit_up_quote(entry_tick, limit_price)
+                    )
+                    limit_up_entries.append({
+                        "stock_code": fill.stock_code,
+                        "trade_date": batch.trade_date,
+                        "entry_time_ms": fill.timestamp_ms,
+                        "signal_id": signal.signal_id,
+                        "limit_price": limit_price,
+                        "ever_sealed": is_sealed,
+                        "broken_after_seal": False,
+                        "sealed_at_close": None,
+                    })
+                return fill
+
             for batch in iter_tick_batches(paths, stock_codes=stock_codes):
                 if current_trade_date and batch.trade_date != current_trade_date:
                     for entry in limit_up_entries:
@@ -320,7 +389,11 @@ class BacktestEngine:
                         ):
                             closing_tick = latest_ticks.get(entry["stock_code"])
                             entry["sealed_at_close"] = bool(
-                                closing_tick and _is_limit_up_tick(closing_tick)
+                                closing_tick
+                                and entry["limit_price"] is not None
+                                and is_sealed_limit_up_quote(
+                                    closing_tick, entry["limit_price"]
+                                )
                             )
                     expired_signal_count += len(pending_signals)
                     pending_signals.clear()
@@ -336,7 +409,12 @@ class BacktestEngine:
                     tick = batch.ticks.get(entry["stock_code"])
                     if tick is None:
                         continue
-                    if _is_limit_up_tick(tick):
+                    if (
+                        entry["limit_price"] is not None
+                        and is_sealed_limit_up_quote(
+                            tick, entry["limit_price"]
+                        )
+                    ):
                         entry["ever_sealed"] = True
                     elif entry["ever_sealed"]:
                         entry["broken_after_seal"] = True
@@ -351,33 +429,27 @@ class BacktestEngine:
                     else:
                         waiting.append((signal_date, signal))
                 pending_signals = waiting
+
+                # Orders released by the previous stock Tick are executable at
+                # this quote and must update cash/positions before the strategy
+                # observes the account.  Calling the strategy first gives it a
+                # stale portfolio and can manufacture duplicate entries/exits.
+                for signal in ready:
+                    execute_and_record(signal, batch)
+
                 current_signals = list(self._signals(batch, broker))
+                signal_count += len(current_signals)
                 if self.config.execute_on_next_tick:
                     for signal in current_signals:
                         if signal.execute_on_current_tick:
-                            ready.append(signal)
+                            execute_and_record(signal, batch)
                         else:
                             pending_signals.append((batch.trade_date, signal))
                 else:
-                    ready.extend(current_signals)
+                    for signal in current_signals:
+                        execute_and_record(signal, batch)
 
-                for signal in ready:
-                    fill = self._execute(signal, batch, broker)
-                    if fill:
-                        fills.append(asdict(fill))
-                        if fill.side == "BUY" and signal.limit_up_entry:
-                            is_sealed = _is_limit_up_tick(
-                                batch.ticks[fill.stock_code]
-                            )
-                            limit_up_entries.append({
-                                "stock_code": fill.stock_code,
-                                "trade_date": batch.trade_date,
-                                "entry_time_ms": fill.timestamp_ms,
-                                "signal_id": signal.signal_id,
-                                "ever_sealed": is_sealed,
-                                "broken_after_seal": False,
-                                "sealed_at_close": None,
-                            })
+                risk_equities.append(float(broker.snapshot()["equity"]))
                 if batches % self.config.sample_equity_every_batches == 0:
                     curve.append(broker.checkpoint_equity(batch.event_time_ms))
 
@@ -385,27 +457,64 @@ class BacktestEngine:
                 for code, position in list(broker.positions.items()):
                     tick = latest_ticks.get(code)
                     if tick and position["available_quantity"]:
+                        end_liquidation_attempt_count += 1
                         fill = broker.sell(
                             code,
                             position["available_quantity"],
                             tick,
                             reason="backtest_end_liquidation",
-                            respect_liquidity=False,
+                            # A report-only convenience must not turn a locked
+                            # limit-down or empty book into guaranteed proceeds.
+                            respect_liquidity=True,
                         )
                         if fill:
+                            end_liquidation_fill_count += 1
                             fills.append(asdict(fill))
+                risk_equities.append(float(broker.snapshot()["equity"]))
             if last_batch is not None:
                 curve.append(broker.checkpoint_equity(last_batch.event_time_ms))
             for entry in limit_up_entries:
                 if entry["sealed_at_close"] is None:
                     closing_tick = latest_ticks.get(entry["stock_code"])
                     entry["sealed_at_close"] = bool(
-                        closing_tick and _is_limit_up_tick(closing_tick)
+                        closing_tick
+                        and entry["limit_price"] is not None
+                        and is_sealed_limit_up_quote(
+                            closing_tick, entry["limit_price"]
+                        )
                     )
             broker._backtest_limit_up_stats = {
                 "entries": limit_up_entries,
             }
-            metrics = calculate_performance(broker, curve, total_batches=batches)
+            metrics = calculate_performance(
+                broker,
+                curve,
+                total_batches=batches,
+                drawdown_equities=risk_equities,
+            )
+            metrics.update({
+                "strategy_signal_count": signal_count,
+                "strategy_execution_attempt_count": execution_attempt_count,
+                "strategy_fill_count": strategy_fill_count,
+                "strategy_rejected_execution_count": (
+                    execution_attempt_count - strategy_fill_count
+                ),
+                "strategy_signal_fill_rate": (
+                    round(strategy_fill_count / signal_count, 8)
+                    if signal_count else None
+                ),
+                "strategy_attempt_fill_rate": (
+                    round(strategy_fill_count / execution_attempt_count, 8)
+                    if execution_attempt_count else None
+                ),
+                "expired_signal_count": expired_signal_count,
+                "unexecuted_signal_count": len(pending_signals),
+                "end_liquidation_attempt_count": end_liquidation_attempt_count,
+                "end_liquidation_fill_count": end_liquidation_fill_count,
+                "end_liquidation_rejected_count": (
+                    end_liquidation_attempt_count - end_liquidation_fill_count
+                ),
+            })
             trades = broker.closed_trades()
             positions = broker.positions
             diagnostics_method = getattr(self.strategy, "diagnostics", None)

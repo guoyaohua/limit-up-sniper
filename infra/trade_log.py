@@ -7,6 +7,7 @@ infra/trade_log.py - 交易日志 & 涨停列表保存
 import os
 import json
 import traceback
+import hashlib
 from datetime import datetime
 from loguru import logger
 
@@ -41,7 +42,8 @@ def _build_tick_snapshot(snapshot: dict | None) -> dict:
 
     summary = {}
     for field in ('time', 'lastPrice', 'open', 'high', 'low', 'lastClose',
-                  'amount', 'volume', 'pvolume', 'stockStatus'):
+                  'amount', 'volume', 'pvolume', 'stockStatus',
+                  'limitUpPrice', 'upperLimitPrice'):
         if field in snapshot:
             summary[field] = snapshot.get(field)
 
@@ -53,10 +55,12 @@ def _build_tick_snapshot(snapshot: dict | None) -> dict:
     return summary
 
 
-def append_trade_event(event_record: dict):
+def append_trade_event(event_record: dict, date_str: str | None = None):
     """追加结构化事件到当日日志 JSONL。"""
     try:
-        filepath = os.path.join(_get_trade_log_dir(), EVENT_LOG_FILENAME)
+        filepath = os.path.join(
+            _get_trade_log_dir(date_str), EVENT_LOG_FILENAME
+        )
         with open(filepath, 'a', encoding='utf-8') as f:
             f.write(
                 json.dumps(event_record,
@@ -117,24 +121,93 @@ def record_strategy_event(shared_data: dict,
     return event_record
 
 
-def save_trade_log(trade_record: dict):
-    """U8升级：保存结构化交易日志到 JSON 文件。"""
-    try:
-        log_dir = _get_trade_log_dir()
-        timestamp = datetime.now().strftime('%H%M%S_%f')
-        stock_code = trade_record.get('stock_code', 'unknown')
-        filename = f'trade_{timestamp}_{stock_code}.json'
-        filepath = os.path.join(log_dir, filename)
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(trade_record, f, ensure_ascii=False, indent=2, default=str)
+def _save_trade_record(trade_record: dict, event_type: str):
+    """Persist one normalized submission/fill record."""
+    log_dir = _get_trade_log_dir()
+    timestamp = datetime.now().strftime('%H%M%S_%f')
+    stock_code = trade_record.get('stock_code', 'unknown')
+    prefix = 'fill' if trade_record.get('record_type') == 'fill' else 'trade'
+    filename = f'{prefix}_{timestamp}_{stock_code}.json'
+    filepath = os.path.join(log_dir, filename)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(trade_record, f, ensure_ascii=False, indent=2, default=str)
+    append_trade_event({'event_type': event_type, **trade_record})
 
-        append_trade_event({
-            'event_type': 'order_submitted',
-            'record_type': 'trade',
+
+def save_trade_log(trade_record: dict):
+    """Save an accepted order-attempt record for operational auditing."""
+    try:
+        # Submission is not execution.  Keep these files available for the
+        # decision funnel, but label them explicitly so PnL review cannot pair
+        # an unfilled limit-up queue order as if it were a broker fill.
+        trade_record = {
             **trade_record,
-        })
+            'record_type': 'order_submission',
+            'execution_status': 'SUBMITTED_NOT_FILLED',
+        }
+        _save_trade_record(trade_record, 'order_submitted')
     except Exception as e:
         logger.debug(f'保存交易日志失败: {e}')
+
+
+def save_trade_fill(fill_record: dict):
+    """Persist a broker-confirmed fill for PnL review and deduplication."""
+    try:
+        record = {
+            **fill_record,
+            'record_type': 'fill',
+            'execution_status': 'FILLED',
+        }
+        trade_id = str(record.get('trade_id', '')).strip()
+        if not trade_id:
+            raise ValueError('broker fill is missing trade_id')
+        trade_date = str(record.get('trade_date', '')).strip()
+        if trade_date:
+            parsed_date = datetime.strptime(trade_date, '%Y%m%d')
+            if parsed_date.strftime('%Y%m%d') != trade_date:
+                raise ValueError(f'invalid broker trade_date: {trade_date!r}')
+        else:
+            trade_date = datetime.now().strftime('%Y%m%d')
+            record['trade_date'] = trade_date
+        # QMT may replay callbacks after reconnect.  One deterministic broker
+        # trade file makes the fill idempotent across threads and restarts.
+        log_dir = _get_trade_log_dir(trade_date)
+        safe_trade_id = ''.join(
+            char if char.isalnum() or char in ('-', '_') else '_'
+            for char in trade_id
+        )[:80]
+        if not safe_trade_id:
+            safe_trade_id = 'unknown'
+        identity = '|'.join((
+            str(record.get('account_id', '')),
+            str(record.get('strategy_name', '')),
+            trade_id,
+        ))
+        identity_hash = hashlib.sha256(
+            identity.encode('utf-8')
+        ).hexdigest()[:16]
+        filepath = os.path.join(
+            log_dir, f'fill_{safe_trade_id}_{identity_hash}.json'
+        )
+        if os.path.exists(filepath):
+            return False
+        temporary = f'{filepath}.{os.getpid()}.tmp'
+        with open(temporary, 'x', encoding='utf-8') as f:
+            json.dump(record, f, ensure_ascii=False, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.replace(temporary, filepath)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        append_trade_event(
+            {'event_type': 'trade_filled', **record}, date_str=trade_date
+        )
+        return True
+    except Exception as e:
+        logger.debug(f'保存成交回报失败: {e}')
+        return False
 
 
 def save_daily_limit_up_list(shared_data):

@@ -64,6 +64,14 @@ def init_shared_data(stock_pool,
             if restored_shared_data:
                 logger.info("成功从备份文件恢复shared_data")
                 shared_data = restored_shared_data
+                for missing_timestamp_key in (
+                        '大盘指数更新时间', '昨日涨停表现更新时间',
+                        '市场情绪_更新时间'):
+                    if missing_timestamp_key not in shared_data:
+                        # Older same-day backups may miss freshness fields.
+                        # Add them stale so monitoring must repopulate every
+                        # dependency before any new buy can pass.
+                        shared_data[missing_timestamp_key] = Value('d', 0.0)
                 # 实时派生数据不能跨进程重启直接复用。监控任务会重新填充
                 # 内容和时间戳；在此之前买入逻辑保持 fail-closed。
                 for realtime_key in (
@@ -73,7 +81,7 @@ def init_shared_data(stock_pool,
                         realtime_data.clear()
                 for timestamp_key in (
                         '概念板块更新时间', '行业板块更新时间',
-                        '个股资金流入更新时间'):
+                        '个股资金流入更新时间', '市场情绪_更新时间'):
                     timestamp_obj = shared_data.get(timestamp_key)
                     if timestamp_obj is not None and hasattr(timestamp_obj,
                                                               'get_lock'):
@@ -211,6 +219,7 @@ def init_shared_data(stock_pool,
                     '昨日涨停表现更新时间': Value('d',
                                         0.0),  # 昨日涨停表现数据最后更新时间（使用double存储时间戳）
                     '市场情绪_评分': Value('d', 0),  # 市场情绪评分
+                    '市场情绪_更新时间': Value('d', 0.0),  # 情绪评分最后成功计算时间
                     '黑名单': manager_proxies['黑名单'],  # 股票代码 -> 黑名单原因
                     '观察名单': manager_proxies['观察名单'],  # 股票代码 -> 观察名单信息
                     '观察名单元数据': manager_proxies['观察名单元数据'],  # 股票代码 -> 观察名单结构化元数据
@@ -358,6 +367,8 @@ def init_shared_data(stock_pool,
                     '创业板指涨跌幅': base_shared_data['创业板指涨跌幅'],  # 创业板指涨跌幅
                     '深证成指涨跌幅': base_shared_data['深证成指涨跌幅'],  # 深证成指涨跌幅
                     '市场情绪_评分': base_shared_data['市场情绪_评分'],  # 市场情绪评分
+                    '市场情绪_更新时间':
+                    base_shared_data['市场情绪_更新时间'],
                     '黑名单': shadow_manager_proxies['黑名单'],  # 股票代码 -> 黑名单原因
                     '观察名单': shadow_manager_proxies['观察名单'],  # 股票代码 -> 观察名单信息
                     '观察名单元数据': shadow_manager_proxies['观察名单元数据'],  # 股票代码 -> 观察名单结构化元数据

@@ -15,7 +15,21 @@ import pytest
 from analysis import pre_market_analysis
 from core import decisions
 from core import gene_calculator
+from core.market_microstructure import (
+    build_local_buy_reservation, exposure_slot_count,
+    is_sealed_limit_up_quote,
+    merge_active_orders_with_local_reservations,
+)
 from engine import tick_processor
+from engine.trader import _accepted_order_id
+from engine.xt_queries import (
+    cache_local_buy_reservation, replace_active_order_cache,
+)
+from infra.xtconstant_compat import xtconstant
+from monitor import sector_monitor, sentiment
+from monitor.indicators import (
+    calculate_market_sentiment_score, market_sentiment_inputs_are_fresh,
+)
 from core.gene_calculator import (
     STRENGTH_SCORE_WEIGHTS,
     calculate_stock_gene,
@@ -37,12 +51,30 @@ class _HotStock:
         self.popularity_tag = '持续上榜'
 
 
+def _current_strong_stock_cache(codes):
+    """Build the smallest cache that proves the current gene schema."""
+    rows = len(codes)
+    data = {
+        column: [1.0] * rows
+        for column in gene_calculator.STRONG_STOCK_CACHE_REQUIRED_COLUMNS
+    }
+    data['股票代码'] = codes
+    data[gene_calculator.STRONG_STOCK_CACHE_VERSION_COLUMN] = [
+        gene_calculator.STRONG_STOCK_CACHE_SCHEMA_VERSION
+    ] * rows
+    for sample_column in (
+            *gene_calculator.PROPORTION_SAMPLE_COLUMNS.values(),
+            *gene_calculator.MEAN_SAMPLE_COLUMNS.values()):
+        data[sample_column] = [10.0] * rows
+    return pd.DataFrame(data)
+
+
 def test_strong_stock_cache_preserves_codes_and_requires_current_pool(
         monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     cache_dir = tmp_path / 'output' / '强势股票'
     cache_dir.mkdir(parents=True)
-    pd.DataFrame({'股票代码': ['000001.SZ', '600000.SH']}).to_csv(
+    _current_strong_stock_cache(['000001.SZ', '600000.SH']).to_csv(
         cache_dir / f'强势股票_{gene_calculator.TODAY}.csv', index=False)
 
     codes = gene_calculator.get_strong_stocks(
@@ -51,13 +83,57 @@ def test_strong_stock_cache_preserves_codes_and_requires_current_pool(
     assert codes == ['000001.SZ', '600000.SH']
 
 
+def test_legacy_strong_stock_cache_cannot_bypass_sample_aware_gene_rules(
+        monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    cache_dir = tmp_path / 'output' / '强势股票'
+    cache_dir.mkdir(parents=True)
+    cache_path = cache_dir / f'强势股票_{gene_calculator.TODAY}.csv'
+    pd.DataFrame({'股票代码': ['000001.SZ']}).to_csv(
+        cache_path, index=False)
+
+    cached, reason = gene_calculator.load_compatible_strong_stock_cache(
+        cache_path, ['000001.SZ'])
+
+    assert cached is None
+    assert '缺少当前选股口径列' in reason
+    assert '首板封板样本数' in reason
+
+
+def test_current_cache_version_still_enforces_reliability_values(tmp_path):
+    cache_path = tmp_path / 'strong.csv'
+    cache = _current_strong_stock_cache(['000001.SZ'])
+    cache['首板封板率'] = 1.0
+    cache['首板封板样本数'] = 1.0
+    cache.to_csv(cache_path, index=False)
+
+    cached, reason = gene_calculator.load_compatible_strong_stock_cache(
+        cache_path, ['000001.SZ'])
+
+    assert cached is None
+    assert reason == '核心评分或首板可靠性门槛值非法'
+
+
+def test_current_cache_rejects_nonfinite_robust_factors(tmp_path):
+    cache_path = tmp_path / 'strong.csv'
+    cache = _current_strong_stock_cache(['000001.SZ'])
+    cache['首板封板率_稳健值'] = float('nan')
+    cache.to_csv(cache_path, index=False)
+
+    cached, reason = gene_calculator.load_compatible_strong_stock_cache(
+        cache_path, ['000001.SZ'])
+
+    assert cached is None
+    assert reason == '核心评分或首板可靠性门槛值非法'
+
+
 def test_strong_stock_cache_loads_without_proprietary_qmt_sdk(
         monkeypatch, tmp_path):
     """A valid local cache must not require XTQuant to be importable."""
     monkeypatch.chdir(tmp_path)
     cache_dir = tmp_path / 'output' / '强势股票'
     cache_dir.mkdir(parents=True)
-    pd.DataFrame({'股票代码': ['000001.SZ']}).to_csv(
+    _current_strong_stock_cache(['000001.SZ']).to_csv(
         cache_dir / f'强势股票_{gene_calculator.TODAY}.csv', index=False)
 
     script = f"""
@@ -105,6 +181,41 @@ def test_strength_score_rewards_better_positive_factors():
     ]
     assert scored.loc[2, '涨停基因打分'] > scored.loc[0, '涨停基因打分']
     assert '涨停基因打分' not in raw.columns
+
+
+def test_strength_score_penalizes_lucky_one_sample_rates():
+    """One lucky observation must not outrank a large reliable history."""
+    raw = pd.DataFrame({
+        '股票代码': ['LUCKY', 'RELIABLE'],
+        '涨停次日收盘溢价超5%比例': [1.0, 0.9],
+        '涨停次日收盘样本数': [1, 100],
+        '首板次日收盘红盘率': [1.0, 0.9],
+        '首板次日收盘样本数': [1, 100],
+        '首板封板率': [1.0, 0.9],
+        '首板封板样本数': [1, 100],
+        '涨停次数': [10, 10],
+        '首板涨停或炸板次日开盘平均溢价': [0.03, 0.03],
+        '首板涨停或炸板次日开盘样本数': [1, 100],
+    })
+
+    scored = calculate_strength_scores(raw).set_index('股票代码')
+
+    assert scored.loc['RELIABLE', '首板封板率_稳健值'] > (
+        scored.loc['LUCKY', '首板封板率_稳健值'])
+    assert scored.loc['RELIABLE', '涨停基因打分'] > (
+        scored.loc['LUCKY', '涨停基因打分'])
+
+
+def test_first_board_gene_requires_minimum_sample_size():
+    raw = pd.DataFrame({
+        '股票代码': ['LUCKY', 'RELIABLE', 'WEAK'],
+        '首板封板率': [1.0, 0.8, 0.6],
+        '首板封板样本数': [1, 10, 20],
+    })
+
+    mask = gene_calculator.reliable_first_board_gene_mask(raw)
+
+    assert mask.tolist() == [False, True, False]
 
 
 def test_next_day_gene_features_only_enter_after_they_are_observable():
@@ -157,6 +268,8 @@ def test_unsettled_latest_limit_up_is_not_counted_as_failed_premium():
     # Row 2 knows the successful outcome of row 0. Its own (still unknown)
     # next-day outcome must not dilute the observed success ratio.
     assert result.loc[2, '涨停次日开盘溢价超5%比例'] == pytest.approx(1.0)
+    assert result.loc[2, '涨停次日开盘样本数'] == 1
+    assert result.loc[2, '涨停次日收盘样本数'] == 1
 
 
 @pytest.mark.parametrize(
@@ -180,6 +293,190 @@ def test_interpolated_requirements_relax_as_sentiment_improves():
 
 def _timestamp_ms(hour, minute, second=0):
     return int(RealDatetime(2026, 7, 10, hour, minute, second).timestamp() * 1000)
+
+
+def test_tick_event_datetime_rejects_missing_or_invalid_timestamp():
+    with pytest.raises(ValueError, match='缺少 time'):
+        decisions._tick_event_datetime({})
+    with pytest.raises(ValueError, match='非法'):
+        decisions._tick_event_datetime({'time': 0})
+
+
+def test_sealed_board_requires_last_bid_limit_and_empty_ask():
+    base = {
+        'lastPrice': 11.0,
+        'bidPrice': [11.0],
+        'askPrice': [0.0],
+    }
+    assert is_sealed_limit_up_quote(base, 11.0) is True
+    assert is_sealed_limit_up_quote(
+        {**base, 'askPrice': [11.0]}, 11.0
+    ) is False
+    assert is_sealed_limit_up_quote(
+        {**base, 'lastPrice': 10.99}, 11.0
+    ) is False
+    assert is_sealed_limit_up_quote(
+        {**base, 'bidPrice': [10.99]}, 11.0
+    ) is False
+    assert is_sealed_limit_up_quote(base) is False
+
+
+def test_exposure_slots_include_pending_buys_without_double_counting():
+    holdings = {'000001.SZ': '{}'}
+    orders = {
+        '000001.SZ': json.dumps([
+            {'委托类型': xtconstant.STOCK_BUY}
+        ]),
+        '600000.SH': json.dumps([
+            {'委托类型': str(xtconstant.STOCK_BUY)}
+        ]),
+        '000002.SZ': json.dumps([
+            {'委托类型': xtconstant.STOCK_SELL}
+        ]),
+    }
+
+    assert exposure_slot_count(holdings, orders) == 2
+
+
+@pytest.mark.parametrize(
+    'malformed_order',
+    [
+        '{broken json', None, [], {}, [{'订单编号': 1}],
+        [{'委托类型': 'unknown'}], ['bad record'],
+    ],
+)
+def test_exposure_slots_fail_closed_for_malformed_active_orders(
+        malformed_order):
+    assert exposure_slot_count(
+        {}, {'000001.SZ': malformed_order}
+    ) == 1
+
+
+def test_exposure_slots_do_not_count_known_sell_orders():
+    orders = {
+        '000001.SZ': [{'委托类型': xtconstant.STOCK_SELL}],
+        '000002.SZ': [{'委托类型': '卖出'}],
+    }
+
+    assert exposure_slot_count({}, orders) == 0
+
+
+def test_exposure_slots_count_buy_even_when_sell_record_comes_first():
+    orders = {'000001.SZ': [
+        {'委托类型': xtconstant.STOCK_SELL},
+        {'委托类型': xtconstant.STOCK_BUY},
+    ]}
+
+    assert exposure_slot_count({}, orders) == 1
+
+
+def test_recent_local_buy_reservation_survives_stale_broker_refresh():
+    reservation = build_local_buy_reservation(
+        '000001.SZ', 123, created_at=100.0
+    )
+
+    merged = merge_active_orders_with_local_reservations(
+        {}, {'000001.SZ': reservation}, now=101.0, ttl_seconds=30.0
+    )
+
+    assert merged == {'000001.SZ': reservation}
+    assert exposure_slot_count({}, merged) == 1
+
+
+def test_local_buy_reservation_expires_or_yields_to_broker_order():
+    reservation = build_local_buy_reservation(
+        '000001.SZ', 123, created_at=100.0
+    )
+    broker_order = json.dumps([
+        {'委托类型': xtconstant.STOCK_BUY, '订单编号': 123}
+    ])
+
+    expired = merge_active_orders_with_local_reservations(
+        {}, {'000001.SZ': reservation}, now=131.0, ttl_seconds=30.0
+    )
+    authoritative = merge_active_orders_with_local_reservations(
+        {'000001.SZ': broker_order},
+        {'000001.SZ': reservation},
+        now=101.0,
+        ttl_seconds=30.0,
+    )
+
+    assert expired == {}
+    assert authoritative == {'000001.SZ': broker_order}
+
+
+def test_local_buy_reservation_is_not_hidden_by_unrelated_sell_order():
+    reservation = build_local_buy_reservation(
+        '000001.SZ', 123, created_at=100.0
+    )
+    broker_sell = json.dumps([
+        {'委托类型': xtconstant.STOCK_SELL, '订单编号': 456}
+    ])
+
+    merged = merge_active_orders_with_local_reservations(
+        {'000001.SZ': broker_sell},
+        {'000001.SZ': reservation},
+        now=101.0,
+        ttl_seconds=30.0,
+    )
+
+    assert exposure_slot_count({}, merged) == 1
+    assert json.loads(merged['000001.SZ'])[0]['订单编号'] == 123
+
+
+@pytest.mark.parametrize(
+    ('order_id', 'accepted'),
+    [(1, True), ('2', True), (0, False), (-1, False), (None, False), ('bad', False)],
+)
+def test_live_order_id_acceptance_is_fail_closed(order_id, accepted):
+    assert _accepted_order_id(order_id) is accepted
+
+
+def test_broker_cache_reconciliation_preserves_recent_local_reservation():
+    shared = {'委托状态': {}}
+    reservation = build_local_buy_reservation(
+        '000001.SZ', 123
+    )
+    cache_local_buy_reservation(shared, '000001.SZ', reservation)
+
+    reconciled = replace_active_order_cache(shared, {})
+
+    assert reconciled == {'000001.SZ': reservation}
+    assert shared['委托状态'] == reconciled
+
+
+def test_should_buy_uses_tick_time_for_late_entry_cutoff(monkeypatch):
+    class EarlyWallClock:
+        @classmethod
+        def now(cls):
+            return RealDatetime(2026, 7, 10, 9, 31)
+
+        @classmethod
+        def fromtimestamp(cls, timestamp):
+            return RealDatetime.fromtimestamp(timestamp)
+
+    monkeypatch.setattr(decisions, 'datetime', EarlyWallClock)
+
+    should_enter = decisions.should_buy(
+        shared_data={},
+        tick_data={'time': _timestamp_ms(14, 50)},
+        stock_code='000001.SZ',
+        is_limit_up=True,
+        is_near_limit_up=False,
+        stock_info={},
+        stock_status={},
+        market_sentiment_score_obj=Value('d', 10.0),
+        blacklist={},
+        strong_stocks=['000001.SZ'],
+        holding_status={},
+        limit_up_pool={},
+        concept_sector_effect={},
+        industry_sector_effect={},
+        individual_capital_inflow={},
+        cancel_count=Value('i', 0),
+    )
+
+    assert should_enter is False
 
 
 @pytest.mark.parametrize(
@@ -232,6 +529,125 @@ def test_realtime_signal_freshness_is_fail_closed():
     assert decisions._timestamp_is_fresh(
         {'更新时间': Value('d', now - 61)}, '更新时间', 60, now=now
     ) is False
+
+
+def test_market_sentiment_zero_board_sample_is_neutral_not_perfect():
+    common = dict(
+        yesterday_first_rate=0.2,
+        yesterday_limit_rate=0.2,
+        yesterday_first_perf=0.0,
+        yesterday_limit_perf=0.0,
+        index_values=[0.0, 0.0, 0.0, 0.0],
+    )
+    no_sample = calculate_market_sentiment_score(
+        limit_up_count=0, break_count=0, break_rate=0.0, **common)
+    observed_perfect = calculate_market_sentiment_score(
+        limit_up_count=1, break_count=0, break_rate=0.0, **common)
+
+    assert observed_perfect - no_sample == pytest.approx(1.5)
+
+
+def test_market_sentiment_yesterday_performance_uses_percentage_points():
+    common = dict(
+        limit_up_count=20, break_count=5, break_rate=0.2,
+        yesterday_first_rate=0.2, yesterday_limit_rate=0.2,
+        index_values=[0.0, 0.0, 0.0, 0.0],
+    )
+    tiny_move = calculate_market_sentiment_score(
+        yesterday_first_perf=0.03, yesterday_limit_perf=0.03, **common)
+    genuine_three_percent = calculate_market_sentiment_score(
+        yesterday_first_perf=3.0, yesterday_limit_perf=3.0, **common)
+
+    assert genuine_three_percent - tiny_move == pytest.approx(1.0)
+
+
+def test_market_sentiment_inputs_require_fresh_underlying_snapshots():
+    now = time.time()
+    shared = {
+        '大盘指数更新时间': Value('d', now - 5),
+        '昨日涨停表现更新时间': Value('d', now - 5),
+    }
+    assert market_sentiment_inputs_are_fresh(shared, now=now) is True
+    shared['大盘指数更新时间'].value = now - 31
+    assert market_sentiment_inputs_are_fresh(shared, now=now) is False
+    assert decisions._timestamp_is_fresh(
+        {'市场情绪_更新时间': Value('d', now - 31)},
+        '市场情绪_更新时间', 30, now=now,
+    ) is False
+
+
+class _FakeXtdata:
+    def __init__(self, ticks):
+        self.ticks = ticks
+
+    def get_full_tick(self, _codes):
+        return self.ticks
+
+
+def _install_fake_xtquant(monkeypatch, ticks):
+    package = types.ModuleType('xtquant')
+    package.xtdata = _FakeXtdata(ticks)
+    monkeypatch.setitem(sys.modules, 'xtquant', package)
+
+
+def _sentiment_shared_data():
+    return {
+        '涨停池': {},
+        '股票状态信号': {},
+        '昨日首板股票': [],
+        '昨日涨停股票': [],
+        '市场情绪_涨停板数量': Value('i', 0),
+        '市场情绪_炸板数量': Value('i', 0),
+        '市场情绪_炸板率': Value('d', 0.0),
+        '市场情绪_昨日首板连板率': Value('d', 0.0),
+        '市场情绪_昨日首板连板个数': Value('i', 0),
+        '市场情绪_昨日涨停连板率': Value('d', 0.0),
+        '市场情绪_昨日涨停连板个数': Value('i', 0),
+        '上证指数涨跌幅': Value('d', 9.0),
+        '沪深300涨跌幅': Value('d', 9.0),
+        '创业板指涨跌幅': Value('d', 9.0),
+        '深证成指涨跌幅': Value('d', 9.0),
+        '大盘指数更新时间': Value('d', 0.0),
+    }
+
+
+def test_index_monitor_rejects_invalid_prices_without_refreshing(monkeypatch):
+    _install_fake_xtquant(monkeypatch, {
+        '000001.SH': {'lastPrice': float('inf'), 'lastClose': 3000.0},
+        '000300.SH': {'lastPrice': 4000.0, 'lastClose': 3990.0},
+        '399006.SZ': {'lastPrice': 2000.0, 'lastClose': 1990.0},
+        '399001.SZ': {'lastPrice': 12000.0, 'lastClose': 11900.0},
+    })
+    monkeypatch.setattr(sentiment, 'is_trading_time', lambda: True)
+    shared = _sentiment_shared_data()
+
+    sentiment.calculate_market_sentiment_metrics(shared)
+
+    assert shared['大盘指数更新时间'].value == 0.0
+    assert shared['上证指数涨跌幅'].value == 9.0
+    assert shared['沪深300涨跌幅'].value == 9.0
+
+
+def test_prior_board_monitor_rejects_nonfinite_prices_without_refreshing(
+        monkeypatch):
+    _install_fake_xtquant(monkeypatch, {
+        '000001.SZ': {'lastPrice': float('inf'), 'lastClose': 10.0},
+        '000002.SZ': {'lastPrice': 11.0, 'lastClose': 10.0},
+    })
+    monkeypatch.setattr(sector_monitor, 'is_trading_time', lambda: True)
+    shared = {
+        '昨日首板股票': ['000001.SZ'],
+        '昨日涨停股票': ['000001.SZ', '000002.SZ'],
+        '市场情绪_昨日首板表现': Value('d', 7.0),
+        '市场情绪_昨日涨停表现': Value('d', 7.0),
+        '昨日涨停表现更新时间': Value('d', 0.0),
+    }
+
+    sector_monitor.ths_monitor_task(shared)
+
+    assert shared['昨日涨停表现更新时间'].value == 0.0
+    assert shared['市场情绪_昨日首板表现'].value == 7.0
+    assert shared['市场情绪_昨日涨停表现'].value == 7.0
 
 
 def test_tick_dispatch_keeps_each_stock_on_one_fifo_partition():
@@ -441,13 +857,16 @@ def test_pre_market_gene_path_uses_project_root_and_preserves_leading_zero(
 def test_pre_market_candidate_pool_is_ranked_and_broad(monkeypatch, tmp_path):
     strong_dir = tmp_path / 'output' / '强势股票'
     strong_dir.mkdir(parents=True)
-    pd.DataFrame({
-        '股票代码': ['000001', '600000', '300001'],
+    cache = _current_strong_stock_cache(['000001', '600000', '300001'])
+    cache = cache.assign(**{
         '股票名称': ['甲', '乙', '丙'],
         '涨停基因打分': [70.0, 95.0, 80.0],
         '首板封板率': [0.8, 0.9, 0.85],
+        '首板封板样本数': [12, 30, 20],
+        '首板封板率_稳健值': [0.55, 0.74, 0.64],
         '首板次日收盘红盘率': [0.6, 0.7, 0.65],
-    }).to_csv(strong_dir / '强势股票_20260710.csv', index=False)
+    })
+    cache.to_csv(strong_dir / '强势股票_20260710.csv', index=False)
     monkeypatch.setattr(pre_market_analysis, 'ROOT_DIR', str(tmp_path))
 
     pool = pre_market_analysis._get_first_board_candidate_pool()
@@ -457,17 +876,33 @@ def test_pre_market_candidate_pool_is_ranked_and_broad(monkeypatch, tmp_path):
     ]
     assert pool[0]['rank'] == 1
     assert pool[0]['seal_rate'] == pytest.approx(0.9)
+    assert pool[0]['seal_samples'] == pytest.approx(30)
+    assert pool[0]['robust_seal_rate'] == pytest.approx(0.74)
+
+
+def test_pre_market_candidate_pool_rejects_legacy_strong_stock_cache(
+        monkeypatch, tmp_path):
+    strong_dir = tmp_path / 'output' / '强势股票'
+    strong_dir.mkdir(parents=True)
+    pd.DataFrame({
+        '股票代码': ['000001'],
+        '涨停基因打分': [99.0],
+    }).to_csv(strong_dir / '强势股票_20260710.csv', index=False)
+    monkeypatch.setattr(pre_market_analysis, 'ROOT_DIR', str(tmp_path))
+
+    assert pre_market_analysis._get_first_board_candidate_pool() == []
 
 
 def test_pre_market_candidate_pool_excludes_yesterday_limit_ups(
         monkeypatch, tmp_path):
     strong_dir = tmp_path / 'output' / '强势股票'
     strong_dir.mkdir(parents=True)
-    pd.DataFrame({
-        '股票代码': ['000001', '600000'],
+    cache = _current_strong_stock_cache(['000001', '600000'])
+    cache = cache.assign(**{
         '股票名称': ['昨日已板', '今日候选'],
         '涨停基因打分': [99.0, 90.0],
-    }).to_csv(strong_dir / '强势股票_20260710.csv', index=False)
+    })
+    cache.to_csv(strong_dir / '强势股票_20260710.csv', index=False)
     monkeypatch.setattr(pre_market_analysis, 'ROOT_DIR', str(tmp_path))
 
     pool = pre_market_analysis._get_first_board_candidate_pool({'000001'})
@@ -489,6 +924,7 @@ def test_candidate_evidence_merges_hot_lists_and_gene_pool():
         [{
             'code': '000001', 'name': '甲', 'rank': 2,
             'gene_score': 88.0, 'seal_rate': 0.85,
+            'seal_samples': 20, 'robust_seal_rate': 0.64,
             'next_day_red_rate': 0.7,
         }],
     )
@@ -499,6 +935,8 @@ def test_candidate_evidence_merges_hot_lists_and_gene_pool():
     assert sources['600000'] == {'24小时热榜'}
     assert {'AI', '机器人', '银行'} <= sectors
     assert '历史首板封板率=85.0%' in text
+    assert '首板有效样本=20次' in text
+    assert '首板封板率95%稳健下界=64.0%' in text
 
 
 def test_candidate_evidence_excludes_yesterday_boards_from_every_source():

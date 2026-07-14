@@ -164,13 +164,17 @@ PENDING → RUNNING → STOPPED
 
 ### 4.1 `save_trade_log(trade_record)`
 
-将单条交易记录保存为 JSON 文件。
+将单条已受理委托保存为 JSON 文件。该文件是操作审计记录，不是成交回报；固定包含
+`record_type=order_submission` 与 `execution_status=SUBMITTED_NOT_FILLED`，不得直接用于
+收益配对。
 
 **文件路径**：`output/trade_logs/{YYYYMMDD}/trade_{timestamp}_{stock_code}.json`
 
 **记录格式**：
 ```json
 {
+    "record_type": "order_submission",
+    "execution_status": "SUBMITTED_NOT_FILLED",
     "时间": "2025-04-10 10:23:45",
     "股票代码": "600000.SH",
     "股票名称": "XX股份",
@@ -184,7 +188,15 @@ PENDING → RUNNING → STOPPED
 }
 ```
 
-### 4.2 `save_daily_limit_up_list(shared_data)`
+### 4.2 `save_trade_fill(fill_record)`
+
+交易回调 `on_stock_trade` 将券商确认成交按“账户 + 策略 + `trade_id`”幂等落盘到
+`fill_{trade_id}_{identity_hash}.json`，标记 `record_type=fill` 和
+`execution_status=FILLED`，并记录券商成交时间与手续费；跨午夜回调仍写入实际成交日。
+只有这些记录能进入日度盈亏配对；
+重复回调不会重复计数，同机多账户或多策略也不会因成交号相同而互相覆盖。
+
+### 4.3 `save_daily_limit_up_list(shared_data)`
 
 从共享数据中提取涨停相关信息，生成三个文件：
 

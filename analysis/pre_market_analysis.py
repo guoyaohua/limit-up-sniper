@@ -205,16 +205,21 @@ def _get_first_board_candidate_pool(yesterday_limit_up_codes=None) -> list[dict]
     leaving intraday execution filters unchanged.
     """
     try:
-        import pandas as pd
-
         latest = _latest_csv(Path(ROOT_DIR) / 'output' / '强势股票')
         if latest is None:
             return []
-        df = pd.read_csv(latest, dtype={'股票代码': str})
-        if '股票代码' not in df.columns:
+        # The pre-market process is another live consumer of this cache.  It
+        # must enforce the same schema gate as main strategy startup so a
+        # legacy code-only CSV cannot re-enter candidates through the LLM path.
+        from core.gene_calculator import load_compatible_strong_stock_cache
+        df, incompatibility = load_compatible_strong_stock_cache(latest)
+        if df is None:
+            logger.warning(
+                '忽略不兼容的盘前强势股票缓存 %s：%s',
+                latest, incompatibility,
+            )
             return []
-        if '涨停基因打分' in df.columns:
-            df = df.sort_values('涨停基因打分', ascending=False)
+        df = df.sort_values('涨停基因打分', ascending=False)
 
         excluded = {
             _normalise_stock_code(code)
@@ -232,6 +237,9 @@ def _get_first_board_candidate_pool(yesterday_limit_up_codes=None) -> list[dict]
                 'rank': rank,
                 'gene_score': _finite_float(row.get('涨停基因打分')),
                 'seal_rate': _finite_float(row.get('首板封板率')),
+                'seal_samples': _finite_float(row.get('首板封板样本数')),
+                'robust_seal_rate': _finite_float(
+                    row.get('首板封板率_稳健值')),
                 'next_day_red_rate': _finite_float(
                     row.get('首板次日收盘红盘率')),
             })
@@ -274,7 +282,8 @@ def _build_candidate_evidence(
     }
     evidence = defaultdict(lambda: {
         'name': '', 'sources': set(), 'concepts': set(), 'ranks': {},
-        'gene_score': None, 'seal_rate': None, 'next_day_red_rate': None,
+        'gene_score': None, 'seal_rate': None, 'seal_samples': None,
+        'robust_seal_rate': None, 'next_day_red_rate': None,
     })
 
     for source_key, data_key in (('hot_1h', 'hot_stocks_1h_raw'),
@@ -301,7 +310,9 @@ def _build_candidate_evidence(
         item['name'] = candidate.get('name') or item['name']
         item['sources'].add('gene_pool')
         item['ranks']['gene_pool'] = candidate['rank']
-        for key in ('gene_score', 'seal_rate', 'next_day_red_rate'):
+        for key in (
+                'gene_score', 'seal_rate', 'seal_samples',
+                'robust_seal_rate', 'next_day_red_rate'):
             item[key] = candidate.get(key)
 
     def evidence_score(item):
@@ -325,6 +336,11 @@ def _build_candidate_evidence(
             metrics.append(f"基因分={item['gene_score']:.1f}")
         if item['seal_rate'] is not None:
             metrics.append(f"历史首板封板率={item['seal_rate']:.1%}")
+        if item['seal_samples'] is not None:
+            metrics.append(f"首板有效样本={int(item['seal_samples'])}次")
+        if item['robust_seal_rate'] is not None:
+            metrics.append(
+                f"首板封板率95%稳健下界={item['robust_seal_rate']:.1%}")
         if item['next_day_red_rate'] is not None:
             metrics.append(f"首板次日红盘率={item['next_day_red_rate']:.1%}")
         lines.append(

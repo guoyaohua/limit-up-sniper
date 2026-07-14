@@ -1,16 +1,55 @@
 #coding=utf-8
 import time
+import math
+from datetime import datetime, timedelta, timezone
 from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
 from xtquant.xttype import StockAccount
 from infra.common_enums import OrderType, PriceType, OrderStatus
+from infra.trade_log import save_trade_fill
 from infra.utils import send_email
 
 
+CHINA_TZ = timezone(timedelta(hours=8), name='Asia/Shanghai')
+
+
+def _broker_trade_datetime(raw_value, fallback=None):
+    """Normalize XTQuant epoch/HHMMSS trade times to China local time."""
+    fallback = fallback or datetime.now(CHINA_TZ)
+    try:
+        numeric = int(raw_value)
+    except (TypeError, ValueError):
+        return fallback
+
+    raw_digits = str(abs(numeric))
+    for date_format in ('%Y%m%d%H%M%S%f', '%Y%m%d%H%M%S'):
+        expected_length = 17 if '%f' in date_format else 14
+        if len(raw_digits) == expected_length:
+            try:
+                parsed = datetime.strptime(raw_digits, date_format)
+                return parsed.replace(tzinfo=CHINA_TZ)
+            except ValueError:
+                pass
+
+    epoch_seconds = numeric / 1000 if numeric >= 10**12 else numeric
+    if 946684800 <= epoch_seconds <= 4102444800:
+        return datetime.fromtimestamp(epoch_seconds, CHINA_TZ)
+
+    digits = str(numeric).zfill(6)
+    if len(digits) == 6:
+        try:
+            clock = datetime.strptime(digits, '%H%M%S').time()
+            return datetime.combine(fallback.date(), clock, CHINA_TZ)
+        except ValueError:
+            pass
+    return fallback
+
+
 class MyXtQuantTraderCallback(XtQuantTraderCallback):
-    def __init__(self, logger, stategy_name=''):
+    def __init__(self, logger, stategy_name='', fill_sink=save_trade_fill):
         super(MyXtQuantTraderCallback, self).__init__()
         self.logger = logger
         self.stategy_name = stategy_name
+        self.fill_sink = fill_sink
         # 记录委托下单时间
         self.order_dict = {}
 
@@ -94,6 +133,22 @@ class MyXtQuantTraderCallback(XtQuantTraderCallback):
         offset_flag	int	交易操作，用此字段区分股票买卖，期货开、平仓，期权买卖等；参见数据字典
 
         """
+        trade_strategy_name = str(
+            getattr(trade, 'strategy_name', '') or ''
+        ).strip()
+        expected_strategy_name = str(self.stategy_name or '').strip()
+        if (expected_strategy_name
+                and trade_strategy_name != expected_strategy_name):
+            # XTQuant pushes every fill for the subscribed account.  Persisting
+            # another strategy's or a manual fill would corrupt both FIFO cost
+            # basis and the reported return of this strategy.
+            self.logger.warning(
+                '[成交回报忽略] 策略名称不匹配: '
+                f'{trade_strategy_name or "<empty>"} != '
+                f'{expected_strategy_name}'
+            )
+            return
+
         msg = '[成交变动推送]\t'
         msg += f'证券代码: {trade.stock_code}, '
         msg += f'委托类型: {OrderType(trade.order_type).name}, '
@@ -108,6 +163,42 @@ class MyXtQuantTraderCallback(XtQuantTraderCallback):
         msg += f'委托备注: {trade.order_remark}, '
         msg += f'交易操作: {trade.offset_flag}'
         self.logger.warning(msg)
+        try:
+            side = (
+                'BUY' if int(trade.order_type) == int(OrderType.买入.value)
+                else 'SELL' if int(trade.order_type) == int(OrderType.卖出.value)
+                else 'UNKNOWN'
+            )
+        except (TypeError, ValueError):
+            side = 'UNKNOWN'
+        if side != 'UNKNOWN':
+            traded_at = _broker_trade_datetime(trade.traded_time)
+            commission = getattr(trade, 'commission', None)
+            try:
+                commission = float(commission)
+                if not math.isfinite(commission) or commission <= 0:
+                    commission = None
+            except (TypeError, ValueError):
+                commission = None
+            self.fill_sink({
+                'action': side,
+                'stock_code': trade.stock_code,
+                'price': trade.traded_price,
+                'volume': trade.traded_volume,
+                'amount': trade.traded_amount,
+                'fees': commission,
+                'timestamp': traded_at.strftime(
+                    '%Y-%m-%d %H:%M:%S.%f'
+                ),
+                'trade_date': traded_at.strftime('%Y%m%d'),
+                'broker_trade_time': trade.traded_time,
+                'trade_id': trade.traded_id,
+                'order_id': trade.order_id,
+                'order_sysid': trade.order_sysid,
+                'account_id': getattr(trade, 'account_id', ''),
+                'strategy_name': trade_strategy_name,
+                'order_remark': trade.order_remark,
+            })
         subject = f'{self.stategy_name} [成交变动推送] {trade.stock_code} {trade.traded_id}' if self.stategy_name else f'[成交变动推送] {trade.stock_code} {trade.traded_id}'
         send_email(subject, msg)
 

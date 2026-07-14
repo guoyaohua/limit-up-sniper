@@ -6,6 +6,7 @@ import pytest
 from engine.paper_broker import BrokerConfig, PaperBroker
 from engine.queue_fill import queued_buy_fill_progress
 from engine.simulator import execute_paper_order, update_paper_market
+import engine.simulator as simulator
 from engine.tick_processor import check_order_successed
 from infra.xtconstant_compat import xtconstant
 from infra.common_enums import OrderType, StockOrderStatusInt
@@ -79,6 +80,31 @@ def test_live_marks_update_shadow_equity_and_position_view():
     assert position["市值"] == 11_000
     assert shared["模拟账户"]["equity"] == pytest.approx(100_994.9)
     assert shared["模拟账户"]["unrealized_pnl"] == pytest.approx(994.9)
+
+
+def test_paper_executor_rejects_buy_when_exposure_slots_are_full(monkeypatch):
+    monkeypatch.setattr(simulator, 'MAX_HOLDING_COUNT', 1)
+    shared = _shared_data()
+    shared['持仓状态']['600000.SH'] = json.dumps({
+        '持仓数量': 100, '可用数量': 0, '成本价': 10.0, '市值': 1_000,
+    })
+    broker = PaperBroker(BrokerConfig(
+        initial_cash=100_000, slippage_bps=0, participation_rate=1, allow_t0=True,
+    ))
+    order = {
+        '委托类型': OrderType.BUY,
+        '买入类型': '扫板',
+        '股票代码': '000001.SZ',
+        '委托价格': 10.0,
+        '委托数量': 100,
+        '快照': _tick(10.0),
+    }
+
+    assert execute_paper_order(broker, order, shared) is None
+    assert broker.positions == {}
+    assert shared['股票状态信号']['000001.SZ']['下单状态'].value == (
+        StockOrderStatusInt.NOT_ORDERED
+    )
 
 
 def _queued_order() -> dict:

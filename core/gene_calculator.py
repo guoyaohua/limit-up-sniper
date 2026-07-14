@@ -139,12 +139,14 @@ def calculate_stock_gene(data, N=250):
         seal_success_rolling_sum = data['封板成功'].rolling(N, min_periods=1).sum()
         seal_success_rolling_count = data['封板成功'].rolling(
             N, min_periods=1).count()
+        data['封板样本数'] = seal_success_rolling_count
         data['封板成功率'] = seal_success_rolling_sum / seal_success_rolling_count
 
         first_board_seal_rolling_sum = data['首板封板'].rolling(
             N, min_periods=1).sum()
         first_board_seal_rolling_count = data['首板封板'].rolling(
             N, min_periods=1).count()
+        data['首板封板样本数'] = first_board_seal_rolling_count
         data[
             '首板封板率'] = first_board_seal_rolling_sum / first_board_seal_rolling_count
 
@@ -152,6 +154,7 @@ def calculate_stock_gene(data, N=250):
                                                           min_periods=1).sum()
         continuous_board_rolling_count = data['连板'].rolling(
             N, min_periods=1).count()
+        data['连板样本数'] = continuous_board_rolling_count
         data[
             '连板率'] = continuous_board_rolling_sum / continuous_board_rolling_count
 
@@ -203,6 +206,7 @@ def calculate_stock_gene(data, N=250):
             known_limit_close.notna()).rolling(N, min_periods=1).sum()
         limit_up_next_close_red_count = known_limit_close.rolling(
             N, min_periods=1).count()
+        data['涨停次日收盘样本数'] = limit_up_next_close_red_count
         data[
             '涨停次日收盘红盘率'] = limit_up_next_close_red_sum / limit_up_next_close_red_count
 
@@ -211,6 +215,7 @@ def calculate_stock_gene(data, N=250):
             known_limit_open.notna()).rolling(N, min_periods=1).sum()
         limit_up_next_open_red_count = known_limit_open.rolling(
             N, min_periods=1).count()
+        data['涨停次日开盘样本数'] = limit_up_next_open_red_count
         data[
             '涨停次日开盘红盘率'] = limit_up_next_open_red_sum / limit_up_next_open_red_count
 
@@ -219,6 +224,7 @@ def calculate_stock_gene(data, N=250):
             known_first_close.notna()).rolling(N, min_periods=1).sum()
         first_board_next_close_red_count = known_first_close.rolling(
             N, min_periods=1).count()
+        data['首板次日收盘样本数'] = first_board_next_close_red_count
         data[
             '首板次日收盘红盘率'] = first_board_next_close_red_sum / first_board_next_close_red_count
 
@@ -227,6 +233,7 @@ def calculate_stock_gene(data, N=250):
             known_first_open.notna()).rolling(N, min_periods=1).sum()
         first_board_next_open_red_count = known_first_open.rolling(
             N, min_periods=1).count()
+        data['首板次日开盘样本数'] = first_board_next_open_red_count
         data[
             '首板次日开盘红盘率'] = first_board_next_open_red_sum / first_board_next_open_red_count
 
@@ -244,6 +251,9 @@ def calculate_stock_gene(data, N=250):
         # 停牌或缺失行情。
         open_denominator = known_limit_open.rolling(N, min_periods=1).count()
         close_denominator = known_limit_close.rolling(N, min_periods=1).count()
+        data['首板涨停或炸板次日开盘样本数'] = known_next_day[
+            '首板涨停或炸板次日开盘溢价'
+        ].rolling(N, min_periods=1).count()
         data['涨停次日开盘溢价超5%比例'] = np.divide(data['涨停次日开盘溢价超5%次数'],
                                            open_denominator,
                                            out=np.full_like(
@@ -278,19 +288,119 @@ STRENGTH_SCORE_WEIGHTS = {
     '首板涨停或炸板次日开盘平均溢价': 0.15,
 }
 
+PROPORTION_SAMPLE_COLUMNS = {
+    '涨停次日收盘溢价超5%比例': '涨停次日收盘样本数',
+    '首板次日收盘红盘率': '首板次日收盘样本数',
+    '首板封板率': '首板封板样本数',
+}
+MEAN_SAMPLE_COLUMNS = {
+    '首板涨停或炸板次日开盘平均溢价': '首板涨停或炸板次日开盘样本数',
+}
+FIRST_BOARD_MIN_SAMPLES = 3
+FIRST_BOARD_MIN_RAW_SEAL_RATE = 0.70
+MEAN_PRIOR_STRENGTH = 5.0
+WILSON_Z_95 = 1.959963984540054
+# Bump whenever admission or ranking semantics change.  Legacy unversioned
+# files are treated as the implicit schema v1.
+STRONG_STOCK_CACHE_SCHEMA_VERSION = 2
+STRONG_STOCK_CACHE_VERSION_COLUMN = '强势股票缓存版本'
+STRONG_STOCK_CACHE_REQUIRED_COLUMNS = frozenset({
+    '股票代码',
+    '涨停基因打分',
+    STRONG_STOCK_CACHE_VERSION_COLUMN,
+    *STRENGTH_SCORE_WEIGHTS.keys(),
+    *PROPORTION_SAMPLE_COLUMNS.values(),
+    *MEAN_SAMPLE_COLUMNS.values(),
+    *(f'{factor}_稳健值' for factor in (
+        *PROPORTION_SAMPLE_COLUMNS, *MEAN_SAMPLE_COLUMNS,
+    )),
+})
+
+
+def _wilson_lower_bound(rate: pd.Series, samples: pd.Series) -> pd.Series:
+    """Return a conservative lower bound for observed success rates."""
+    probability = pd.to_numeric(rate, errors='coerce').clip(0.0, 1.0)
+    count = pd.to_numeric(samples, errors='coerce').clip(lower=0.0)
+    safe_count = count.where(count > 0)
+    z_squared = WILSON_Z_95 * WILSON_Z_95
+    denominator = 1.0 + z_squared / safe_count
+    centre = probability + z_squared / (2.0 * safe_count)
+    margin = WILSON_Z_95 * np.sqrt(
+        probability * (1.0 - probability) / safe_count
+        + z_squared / (4.0 * safe_count * safe_count)
+    )
+    result = (centre - margin) / denominator
+    return result.where(count > 0)
+
+
+def add_reliability_adjusted_gene_features(
+        result_df: pd.DataFrame) -> pd.DataFrame:
+    """Add sample-aware factors used by the cross-sectional ranking.
+
+    Proportions use a Wilson 95% lower bound. Mean next-day premium is shrunk
+    towards the pooled, event-weighted market mean with five prior
+    observations. Missing count columns fall back to historical behaviour so
+    old research fixtures remain readable; live strong-stock caches are
+    version-checked separately before this helper can be bypassed.
+    """
+    adjusted = result_df.copy()
+    for factor, count_column in PROPORTION_SAMPLE_COLUMNS.items():
+        robust_column = f'{factor}_稳健值'
+        if count_column in adjusted.columns:
+            adjusted[robust_column] = _wilson_lower_bound(
+                adjusted[factor], adjusted[count_column])
+        else:
+            adjusted[robust_column] = adjusted[factor]
+
+    for factor, count_column in MEAN_SAMPLE_COLUMNS.items():
+        robust_column = f'{factor}_稳健值'
+        if count_column not in adjusted.columns:
+            adjusted[robust_column] = adjusted[factor]
+            continue
+        values = pd.to_numeric(adjusted[factor], errors='coerce')
+        counts = pd.to_numeric(
+            adjusted[count_column], errors='coerce').clip(lower=0.0)
+        valid = values.notna() & counts.gt(0)
+        total_samples = counts[valid].sum()
+        pooled_mean = (
+            (values[valid] * counts[valid]).sum() / total_samples
+            if total_samples > 0 else np.nan
+        )
+        adjusted[robust_column] = (
+            values * counts + pooled_mean * MEAN_PRIOR_STRENGTH
+        ) / (counts + MEAN_PRIOR_STRENGTH)
+        adjusted.loc[~valid, robust_column] = np.nan
+
+    return adjusted
+
+
+def reliable_first_board_gene_mask(result_df: pd.DataFrame) -> pd.Series:
+    """Identify stocks with enough evidence behind a >70% raw seal rate."""
+    rate = pd.to_numeric(result_df['首板封板率'], errors='coerce')
+    if '首板封板样本数' not in result_df.columns:
+        return rate.gt(FIRST_BOARD_MIN_RAW_SEAL_RATE)
+    samples = pd.to_numeric(
+        result_df['首板封板样本数'], errors='coerce').fillna(0)
+    return rate.gt(FIRST_BOARD_MIN_RAW_SEAL_RATE) & samples.ge(
+        FIRST_BOARD_MIN_SAMPLES)
+
 
 def calculate_strength_scores(result_df: pd.DataFrame) -> pd.DataFrame:
-    """Return positive percentile scores for the stock-strength factors.
+    """Return reliability-adjusted percentiles for strength factors.
 
-    Every factor is directional: a larger raw value must produce a larger
-    percentile and therefore a larger composite score.  Keeping this in a
-    pure helper makes the stock-pool ranking independently testable.
+    Higher evidence-backed values produce higher scores, while a high raw rate
+    based on very few events is penalized. Keeping this in a pure helper makes
+    the stock-pool ranking independently testable.
     """
-    scored = result_df.copy()
+    scored = add_reliability_adjusted_gene_features(result_df)
     for factor in STRENGTH_SCORE_WEIGHTS:
+        robust_factor = f'{factor}_稳健值'
+        ranking_factor = (
+            robust_factor if robust_factor in scored.columns else factor
+        )
         # pandas percentile rank grows with the raw value only when
         # ascending=True.  The previous descending rank inverted selection.
-        scored[f'{factor}_得分'] = scored[factor].rank(
+        scored[f'{factor}_得分'] = scored[ranking_factor].rank(
             ascending=True, pct=True
         ) * 100
 
@@ -301,27 +411,115 @@ def calculate_strength_scores(result_df: pd.DataFrame) -> pd.DataFrame:
     return scored
 
 
+def load_compatible_strong_stock_cache(output_path, stock_pool=None):
+    """Load a strong-stock cache only when it proves the current schema.
+
+    A same-day filename is not sufficient evidence that the candidates were
+    produced by the current sample-aware ranking.  In particular, legacy CSVs
+    can contain only stock codes and would otherwise bypass the minimum sample
+    gate and Wilson/shrinkage adjustments added in the 2026-07-14 review.
+
+    Returns ``(dataframe, '')`` for a compatible cache and ``(None, reason)``
+    for a miss, malformed file, stale schema, or stock-pool mismatch.
+    """
+    if not os.path.exists(output_path):
+        return None, '文件不存在'
+
+    try:
+        cache_df = pd.read_csv(output_path, dtype={'股票代码': str})
+    except Exception as exc:
+        return None, f'文件不可读: {exc}'
+
+    missing = sorted(
+        STRONG_STOCK_CACHE_REQUIRED_COLUMNS - set(cache_df.columns)
+    )
+    if missing:
+        return None, f'缺少当前选股口径列: {", ".join(missing)}'
+
+    versions = pd.to_numeric(
+        cache_df[STRONG_STOCK_CACHE_VERSION_COLUMN], errors='coerce'
+    )
+    if not cache_df.empty and (
+            versions.isna().any()
+            or not versions.eq(STRONG_STOCK_CACHE_SCHEMA_VERSION).all()):
+        observed = sorted({
+            str(value) for value in
+            cache_df[STRONG_STOCK_CACHE_VERSION_COLUMN].dropna().unique()
+        })
+        return None, (
+            f'缓存版本不匹配: 期望 {STRONG_STOCK_CACHE_SCHEMA_VERSION}, '
+            f'实际 {observed or ["空值"]}'
+        )
+
+    codes = cache_df['股票代码']
+    if codes.isna().any():
+        return None, '股票代码存在空值'
+    normalized_codes = codes.astype(str).str.strip()
+    if normalized_codes.eq('').any():
+        return None, '股票代码存在空字符串'
+    cache_df = cache_df.copy()
+    cache_df['股票代码'] = normalized_codes
+
+    # These are hard admission gates in the current strategy, not merely
+    # display columns.  Validate their values as well as their presence so a
+    # truncated/corrupt current-version CSV cannot silently restore rejected
+    # low-sample names.
+    seal_rates = pd.to_numeric(cache_df['首板封板率'], errors='coerce')
+    seal_samples = pd.to_numeric(
+        cache_df['首板封板样本数'], errors='coerce'
+    )
+    scores = pd.to_numeric(cache_df['涨停基因打分'], errors='coerce')
+    reliability_columns = [
+        *STRENGTH_SCORE_WEIGHTS.keys(),
+        *PROPORTION_SAMPLE_COLUMNS.values(),
+        *MEAN_SAMPLE_COLUMNS.values(),
+        *(f'{factor}_稳健值' for factor in (
+            *PROPORTION_SAMPLE_COLUMNS, *MEAN_SAMPLE_COLUMNS,
+        )),
+    ]
+    reliability_values = cache_df[reliability_columns].apply(
+        pd.to_numeric, errors='coerce'
+    )
+    if (
+            (~np.isfinite(seal_rates)).any()
+            or (~np.isfinite(seal_samples)).any()
+            or (~np.isfinite(scores)).any()
+            or (~np.isfinite(reliability_values)).any(axis=None)
+            or seal_rates.le(FIRST_BOARD_MIN_RAW_SEAL_RATE).any()
+            or seal_samples.lt(FIRST_BOARD_MIN_SAMPLES).any()
+            or reliability_values[list(
+                PROPORTION_SAMPLE_COLUMNS.values()
+            )].le(0).any(axis=None)
+            or reliability_values[list(
+                MEAN_SAMPLE_COLUMNS.values()
+            )].le(0).any(axis=None)):
+        return None, '核心评分或首板可靠性门槛值非法'
+
+    if stock_pool is not None:
+        valid_pool = {str(code).strip() for code in stock_pool}
+        unknown = sorted(set(normalized_codes) - valid_pool)
+        if unknown:
+            return None, f'包含 {len(unknown)} 个当前股票池外代码'
+
+    return cache_df, ''
+
+
 def get_strong_stocks(stock_pool, stock_info_dict, end_date):
     try:
         # ---------------------------------- 载入本地文件 ---------------------------------- #
         output_path = os.path.join('output', '强势股票', f'强势股票_{TODAY}.csv')
         if os.path.exists(output_path):
-            strong_stock_df = pd.read_csv(
-                output_path, dtype={'股票代码': str})
-            if "股票代码" not in strong_stock_df.columns:
-                raise ValueError(f'强势股票缓存缺少股票代码列: {output_path}')
-            cached_codes = [
-                str(code) for code in strong_stock_df["股票代码"].dropna()
-            ]
-            valid_pool = set(stock_pool)
-            unknown = sorted(set(cached_codes) - valid_pool)
-            if unknown:
+            strong_stock_df, incompatibility = (
+                load_compatible_strong_stock_cache(output_path, stock_pool)
+            )
+            if strong_stock_df is None:
                 logger.warning(
-                    f'日期：{TODAY}，强势股票缓存与当前股票池不一致，'
-                    f'忽略缓存并重新计算；异常代码数：{len(unknown)}')
+                    f'日期：{TODAY}，强势股票缓存不可用，忽略并重新计算；'
+                    f'原因：{incompatibility}')
             else:
+                cached_codes = strong_stock_df["股票代码"].tolist()
                 logger.info(
-                    f'日期：{TODAY}，强势股票数据已存在且通过股票池校验，'
+                    f'日期：{TODAY}，强势股票数据已存在且通过版本、字段和股票池校验，'
                     f'直接加载 {output_path}')
                 return list(dict.fromkeys(cached_codes))
     except Exception as e:
@@ -515,11 +713,15 @@ def get_strong_stocks(stock_pool, stock_info_dict, end_date):
     invalid_stock_list.extend(stock_list)
     logger.info(f'日期：{TODAY}，近一年无涨停的股票数量：{len(stock_list)}, 股票代码：{stock_list}')
 
-    # 8. 过滤掉首版封板率小于0.7的股票
-    stock_list = result_df.loc[result_df['首板封板率'] <= 0.7, '股票代码'].tolist()
+    # review 20260714: 原始比例必须同时满足最小样本量，避免 1/1=100%
+    # 的偶然样本进入实盘核心池。排名阶段还会使用 Wilson 下界。
+    reliable_first_board = reliable_first_board_gene_mask(result_df)
+    stock_list = result_df.loc[~reliable_first_board, '股票代码'].tolist()
     invalid_stock_list.extend(stock_list)
     logger.info(
-        f'日期：{TODAY}，首版封板率小于0.7的股票数量：{len(stock_list)}, 股票代码：{stock_list}')
+        f'日期：{TODAY}，首板封板率不高于{FIRST_BOARD_MIN_RAW_SEAL_RATE:.0%}'
+        f'或有效样本少于{FIRST_BOARD_MIN_SAMPLES}次的股票数量：{len(stock_list)}, '
+        f'股票代码：{stock_list}')
 
     # --------------------------------- 计算涨停基因打分 --------------------------------- #
     # 五项正向因子先转成 0-100 百分位，再按固定权重求和。
@@ -529,6 +731,16 @@ def get_strong_stocks(stock_pool, stock_info_dict, end_date):
     # ------------------------------- 筛选出涨停基因良好的股票 ------------------------------- #
     strong_stock_df = result_df.loc[
         ~result_df['股票代码'].isin(invalid_stock_list)].reset_index(drop=True)
+    finite_score = np.isfinite(pd.to_numeric(
+        strong_stock_df['涨停基因打分'], errors='coerce'
+    ))
+    incomplete_count = int((~finite_score).sum())
+    if incomplete_count:
+        logger.warning(
+            f'日期：{TODAY}，剔除缺少完整可靠性评分的股票数量：'
+            f'{incomplete_count}')
+        strong_stock_df = strong_stock_df.loc[finite_score].reset_index(
+            drop=True)
     logger.info(
         f'日期：{TODAY}，初筛过滤掉的股票数量：{len(set(invalid_stock_list))}，剩余数量：{len(strong_stock_df)}'
     )
@@ -536,7 +748,10 @@ def get_strong_stocks(stock_pool, stock_info_dict, end_date):
     # 筛选涨停基因前1000的股票
     strong_stock_df = strong_stock_df.sort_values(
         '涨停基因打分', ascending=False).reset_index(drop=True)
-    strong_stock_df = strong_stock_df.head(1000)
+    strong_stock_df = strong_stock_df.head(1000).copy()
+    strong_stock_df[STRONG_STOCK_CACHE_VERSION_COLUMN] = (
+        STRONG_STOCK_CACHE_SCHEMA_VERSION
+    )
     logger.info(
         f'日期：{TODAY}，强势股票数量：{len(strong_stock_df)}，股票代码：{strong_stock_df["股票代码"].tolist()}'
     )
