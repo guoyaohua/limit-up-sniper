@@ -1,0 +1,4 @@
+{
+  "description": "核心强势池加盘前扩展候选；其余规则与 Baseline 相同",
+  "include_exploration_candidates": true
+}

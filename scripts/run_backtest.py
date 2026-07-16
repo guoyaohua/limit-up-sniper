@@ -14,6 +14,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from engine.backtest import BacktestConfig, BacktestEngine, write_backtest_result
 from engine.event_replay import EventLogReplayStrategy, load_replay_events
+from engine.event_replay import SUPPORTED_EVENT_SOURCES
 from engine.paper_broker import BrokerConfig
 
 
@@ -70,7 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--stocks", nargs="*", help="仅回放指定股票")
     parser.add_argument(
-        "--event-source", choices=("primary", "shadow"), default="primary"
+        "--event-source", choices=tuple(sorted(SUPPORTED_EVENT_SOURCES)),
+        default="primary"
     )
     parser.add_argument(
         "--accept-legacy-unlabelled-events",

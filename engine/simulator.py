@@ -50,10 +50,43 @@ def _env_bool(name: str, default: bool) -> bool:
     raise ValueError(f"{name} must be true or false")
 
 
-def paper_broker_config(shadow_signal_mode: bool = False) -> BrokerConfig:
-    default_cash = 10_000_000 if shadow_signal_mode else 1_000_000
+_PAPER_LANES = {"primary_simulation", "live_mirror", "coverage",
+                "baseline", "challenger"}
+
+
+def _normalize_lane(lane: str | bool | None) -> str:
+    if isinstance(lane, bool):
+        return "coverage" if lane else "primary_simulation"
+    normalized = str(lane or "primary_simulation").strip().lower()
+    if normalized not in _PAPER_LANES:
+        raise ValueError(f"未知纸面账户通道: {normalized!r}")
+    return normalized
+
+
+def _lane_env_float(lane: str, suffix: str, default: float) -> float:
+    prefix = lane.upper().replace("-", "_")
+    return _env_float(
+        f"LIMIT_UP_{prefix}_{suffix}",
+        _env_float(f"LIMIT_UP_PAPER_{suffix}", default),
+    )
+
+
+def paper_broker_config(lane: str | bool = "primary_simulation") -> BrokerConfig:
+    lane = _normalize_lane(lane)
+    if lane == "coverage":
+        # Coverage is a fixed-notional signal census.  Its cash pool is only a
+        # technical ceiling and must not silently inherit a small production
+        # simulation balance from LIMIT_UP_PAPER_INITIAL_CASH.
+        initial_cash = _env_float("LIMIT_UP_COVERAGE_INITIAL_CASH", 1_000_000_000)
+    elif lane in {"baseline", "challenger"}:
+        initial_cash = _env_float(
+            "LIMIT_UP_EXPERIMENT_INITIAL_CASH",
+            _env_float("LIMIT_UP_PAPER_INITIAL_CASH", 1_000_000),
+        )
+    else:
+        initial_cash = _lane_env_float(lane, "INITIAL_CASH", 1_000_000)
     return BrokerConfig(
-        initial_cash=_env_float("LIMIT_UP_PAPER_INITIAL_CASH", default_cash),
+        initial_cash=initial_cash,
         commission_rate=_env_float("LIMIT_UP_PAPER_COMMISSION_RATE", 0.0003),
         minimum_commission=_env_float("LIMIT_UP_PAPER_MIN_COMMISSION", 5.0),
         stamp_duty_rate=_env_float("LIMIT_UP_PAPER_STAMP_DUTY_RATE", 0.0005),
@@ -64,18 +97,23 @@ def paper_broker_config(shadow_signal_mode: bool = False) -> BrokerConfig:
     )
 
 
-def paper_database_path(shadow_signal_mode: bool = False) -> Path:
+def paper_database_path(
+    lane: str | bool = "primary_simulation", experiment_id: str = ""
+) -> Path:
+    lane = _normalize_lane(lane)
     configured = os.getenv("LIMIT_UP_PAPER_DB")
-    if configured:
-        base = Path(configured).expanduser()
-        if base.suffix:
-            return base.resolve()
-        return (base / ("shadow.sqlite3" if shadow_signal_mode else "simulation.sqlite3")).resolve()
-    return (
-        Path("output")
-        / "paper_trading"
-        / ("shadow.sqlite3" if shadow_signal_mode else "simulation.sqlite3")
-    ).resolve()
+    base = Path(configured).expanduser() if configured else Path("output") / "paper_trading"
+    if base.suffix:
+        if lane != "primary_simulation":
+            raise ValueError(
+                "LIMIT_UP_PAPER_DB 指向单个文件时不能启用多个纸面通道"
+            )
+        return base.resolve()
+    if lane in {"baseline", "challenger"}:
+        from core.runtime_lanes import validate_experiment_id
+        experiment_id = validate_experiment_id(experiment_id)
+        return (base / "experiments" / experiment_id / f"{lane}.sqlite3").resolve()
+    return (base / f"{lane}.sqlite3").resolve()
 
 
 def _set_status(shared_data: Mapping[str, Any], stock_code: str, value: int) -> None:
@@ -117,18 +155,38 @@ def _seed_existing_positions(
     for stock_code, encoded in list(shared_data["持仓状态"].items()):
         try:
             position = json.loads(encoded) if isinstance(encoded, str) else dict(encoded)
+            available_quantity = int(position.get("可用数量", 0) or 0)
+            # Legacy shared views do not persist opened_date.  A restored
+            # position necessarily came from an earlier session/day, so seed
+            # it as prior inventory instead of freezing it forever at T+1.
+            opened_date = str(position.get("开仓日期", "19700101") or "19700101")
+            if opened_date < datetime.now().strftime("%Y%m%d"):
+                available_quantity = int(position.get("持仓数量", 0) or 0)
             broker.restore_position(
                 stock_code,
                 int(position.get("持仓数量", 0) or 0),
                 float(position.get("成本价", 0) or 0),
-                available_quantity=int(position.get("可用数量", 0) or 0),
+                available_quantity=available_quantity,
                 mark_price=(
                     float(position.get("市值", 0) or 0)
                     / max(1, int(position.get("持仓数量", 0) or 0))
                 ),
+                opened_date=opened_date,
             )
         except (TypeError, ValueError, json.JSONDecodeError):
             logger.warning(f"[模拟] 无法导入既有持仓: {stock_code}")
+
+
+def _register_opening_positions(
+    broker: PaperBroker, shared_data: Mapping[str, Any]
+) -> None:
+    pre_market = shared_data.get("盘前持仓")
+    if pre_market is None:
+        return
+    existing = set(pre_market)
+    for stock_code in broker.positions:
+        if stock_code not in existing:
+            pre_market.append(stock_code)
 
 
 def mark_paper_positions(
@@ -146,6 +204,7 @@ def _requested_buy_quantity(
     order_req: Mapping[str, Any],
     shared_data: Mapping[str, Any],
     shadow_signal_mode: bool,
+    lane: str = "primary_simulation",
 ) -> int:
     requested = int(order_req.get("委托数量", 0) or 0)
     if requested > 0:
@@ -157,11 +216,13 @@ def _requested_buy_quantity(
     if price <= 0:
         return 0
 
-    max_position_value = (
-        100_000.0
-        if shadow_signal_mode
-        else broker.config.initial_cash / max(1, MAX_HOLDING_COUNT)
-    )
+    if lane == "coverage":
+        max_position_value = _lane_env_float(
+            "coverage", "POSITION_VALUE", 100_000.0)
+        budget = min(max_position_value, broker.cash)
+        return int(budget / price / broker.config.lot_size) * broker.config.lot_size
+
+    max_position_value = broker.config.initial_cash / max(1, MAX_HOLDING_COUNT)
     amplitude = float(
         shared_data.get("股票信息", {})
         .get(order_req["股票代码"], {})
@@ -196,6 +257,7 @@ def execute_paper_order(
     shared_data: Mapping[str, Any],
     *,
     shadow_signal_mode: bool = False,
+    lane: str = "primary_simulation",
 ) -> Fill | None:
     """Execute one legacy order request and update strategy-compatible state."""
     stock_code = str(order_req["股票代码"])
@@ -224,11 +286,12 @@ def execute_paper_order(
             return None
         # review 20260714: pending buys consume exposure too; otherwise several
         # worker signals can exceed the documented maximum holding count.
-        if exposure_slot_count(shared_data["持仓状态"], pending) >= MAX_HOLDING_COUNT:
+        if (lane != "coverage" and
+                exposure_slot_count(shared_data["持仓状态"], pending) >= MAX_HOLDING_COUNT):
             _set_status(shared_data, stock_code, StockOrderStatusInt.NOT_ORDERED)
             return None
         quantity = _requested_buy_quantity(
-            broker, order_req, shared_data, shadow_signal_mode
+            broker, order_req, shared_data, shadow_signal_mode, lane
         )
         if quantity <= 0:
             return None
@@ -267,7 +330,8 @@ def execute_paper_order(
         return None
 
     if order_type == OrderType.BUY:
-        if (stock_code not in broker.positions
+        if (lane != "coverage"
+                and stock_code not in broker.positions
                 and order_req.get("买入类型") != "模拟成交"
                 and exposure_slot_count(shared_data["持仓状态"], pending)
                 >= MAX_HOLDING_COUNT):
@@ -308,7 +372,7 @@ def execute_paper_order(
             respect_liquidity = False
         else:
             quantity = _requested_buy_quantity(
-                broker, order_req, shared_data, shadow_signal_mode
+                broker, order_req, shared_data, shadow_signal_mode, lane
             )
             limit_price = float(order_req.get("委托价格", 0) or 0) or None
             respect_liquidity = True
@@ -370,11 +434,14 @@ def run_xt_trader_simulator(
     shared_data,
     shadow_signal_mode: bool = False,
     market_queue=None,
+    lane: str | None = None,
+    experiment_id: str = "",
+    stop_event=None,
 ):
     """Consume strategy orders and live marks into a persistent paper account."""
-    mode = "shadow" if shadow_signal_mode else "simulation"
-    database_path = paper_database_path(shadow_signal_mode)
-    config = paper_broker_config(shadow_signal_mode)
+    mode = _normalize_lane(lane if lane is not None else shadow_signal_mode)
+    database_path = paper_database_path(mode, experiment_id)
+    config = paper_broker_config(mode)
     logger.info(
         f"[{mode}] 纸面账户启动: 初始资金={config.initial_cash:,.0f}, "
         f"账本={database_path}"
@@ -387,8 +454,12 @@ def run_xt_trader_simulator(
         ) as broker:
             _seed_existing_positions(broker, shared_data)
             _sync_positions(broker, shared_data)
+            _register_opening_positions(broker, shared_data)
             last_checkpoint_at = 0.0
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    logger.info(f"[{mode}] 收到停止信号: {broker.snapshot()}")
+                    return
                 try:
                     marked = False
                     if market_queue is not None:
@@ -417,6 +488,7 @@ def run_xt_trader_simulator(
                         order_req,
                         shared_data,
                         shadow_signal_mode=shadow_signal_mode,
+                        lane=mode,
                     )
                     if fill:
                         logger.warning(

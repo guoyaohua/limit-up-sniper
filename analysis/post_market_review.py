@@ -78,7 +78,7 @@ class ReviewConfig:
     MARKET_CLOSE_TIME = "15:00"
 
     # Strategy version
-    STRATEGY_VERSION = "v1.0"
+    STRATEGY_VERSION = "v1.1"
     STRATEGY_NAME = "FirstLimitUp"
     
     # Trading mode: 'shadow' for shadow signal mode, 'live' for live trading mode
@@ -231,7 +231,10 @@ class EnhancedDataCollector:
         self.date = date
         self.strategy_version = strategy_version or ReviewConfig.STRATEGY_VERSION
         self.trading_mode = trading_mode or ReviewConfig.TRADING_MODE  # 'shadow' or 'live'
-        self.data_dir = ReviewConfig.DATA_BACKUP_DIR / f"{ReviewConfig.STRATEGY_NAME}_{self.strategy_version}"
+        strategy_dir = f"{ReviewConfig.STRATEGY_NAME}_{self.strategy_version}"
+        if self.trading_mode == 'simulation':
+            strategy_dir += '_Simulation'
+        self.data_dir = ReviewConfig.DATA_BACKUP_DIR / strategy_dir
         self.log_dir = ReviewConfig.LOG_DIR / f"{ReviewConfig.STRATEGY_NAME}_{self.strategy_version}" / "DEBUG"
         self.report_dir = ReviewConfig.REPORT_DIR
         
@@ -400,9 +403,9 @@ class EnhancedDataCollector:
         - live: 实盘模式，使用 shared_data_backup_{date}.pkl
         """
         # 根据交易模式选择不同的文件名前缀
-        if self.trading_mode == 'live':
+        if self.trading_mode in ('live', 'simulation'):
             pattern = f"shared_data_backup_{self.date}*.pkl"
-            mode_desc = "实盘"
+            mode_desc = "实盘" if self.trading_mode == 'live' else "模拟"
         else:  # shadow mode (default)
             pattern = f"shadow_shared_data_backup_{self.date}*.pkl"
             mode_desc = "影子"
@@ -1309,7 +1312,7 @@ class EnhancedDataCollector:
         # 根据交易模式选择不同的正则表达式
         # 日志格式: {log_prefix}[不买入-{原因}] [{排板/扫板}] {stock_code} ...
         # 其中 log_prefix 在实盘模式下为空，影子模式下为 "[影子信号] "
-        if self.trading_mode == 'live':
+        if self.trading_mode in ('live', 'simulation'):
             # 实盘模式：[不买入-XXX] {stock_code} 或 [不买入-XXX] [排板/扫板] {stock_code}
             # 注意：实盘模式下没有 [影子信号] 前缀，但要排除影子模式的日志
             pattern = r'(?<!\[影子信号\]\s)\[不买入-([^\]]+)\]\s*(?:\[([^\]]+)\])?\s*(\d{6}\.\w{2})'
@@ -1397,7 +1400,7 @@ class EnhancedDataCollector:
         # 根据交易模式选择不同的正则表达式
         # 日志格式: {log_prefix}{stock_code} {stock_name} {撤单原因}，撤单
         # 其中 log_prefix 在实盘模式下为空，影子模式下为 "[影子信号] "
-        if self.trading_mode == 'live':
+        if self.trading_mode in ('live', 'simulation'):
             # 实盘模式：{stock_code} {stock_name} {撤单原因}，撤单
             # 注意：实盘模式下没有 [影子信号] 前缀，需要排除影子模式的日志
             pattern = r'(?<!\[影子信号\]\s)(\d{6}\.\w{2})\s+\S+\s+(.+?)(?:，撤单|$)'
@@ -4073,13 +4076,14 @@ def main():
     parser.add_argument(
         '--strategy-version',
         type=str,
-        help='Strategy version (e.g., v2.1, v2.2, v2.3). Defaults to v2.1.',
+        help='Strategy version (for example, v1.1). Defaults to v1.1.',
         default=None)
     parser.add_argument(
         '--trading-mode',
         type=str,
-        choices=['shadow', 'live'],
-        help='Trading mode: "shadow" for shadow signal mode, "live" for live trading mode. Defaults to shadow.',
+        choices=['shadow', 'live', 'simulation'],
+        help=('Trading mode: "live" for live trading, "simulation" for the '
+              'primary paper account, or "shadow" for legacy logs. Defaults to live.'),
         default=None)
     parser.add_argument(
         '--multi-day',

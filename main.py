@@ -9,7 +9,9 @@ import os
 import time
 import traceback
 from datetime import datetime
-from multiprocessing import Queue
+from multiprocessing import Queue, Value
+from queue import Queue as ThreadQueue
+from threading import Event
 from loguru import logger
 
 # 确保项目根目录和依赖在 sys.path 中（进程 fork 前设置）
@@ -22,7 +24,8 @@ if DEPS_DIR not in sys.path:
     sys.path.insert(0, DEPS_DIR)
 
 from config import (
-    VERSION, DEBUG_MODE, IS_LIVE_TRADING, ENABLE_SHADOW_SIGNAL,
+    VERSION, DEBUG_MODE, IS_LIVE_TRADING, ENABLE_COVERAGE, ENABLE_MIRROR,
+    ENABLE_CHALLENGER, CHALLENGER_PROFILE, EXPERIMENT_ID, ARCHIVE_TICKS,
     ENABLE_PRE_MARKET_LLM_ANALYSIS, IP, PORT, STOP_TIME, TODAY,
     STRATEGY_NAME, MONITOR_LOG_PATH, SECTOR_DATA_SOURCE,
     AUTO_REFRESH_THS_SECTOR_MAPPING, IWENCAI_SECTOR_URL,
@@ -30,7 +33,7 @@ from config import (
     IWENCAI_HEADLESS,
     IWENCAI_PAGE_SIZE, IWENCAI_MAX_PAGES,
     CLIENT_NAME, CLIENT_PATH, STOCK_ACCOUNT,
-    TICK_PROCESSOR_COUNT, SHADOW_TICK_PROCESSOR_COUNT,
+    TICK_PROCESSOR_COUNT, RESEARCH_TICK_PROCESSOR_COUNT,
 )
 from infra.common_enums import *
 from infra.utils import send_email, init_logger
@@ -40,15 +43,53 @@ from infra.task_manager import TaskManager, TaskInfo, get_task_manager
 from data.shared_data import init_shared_data
 from core.stock_pool import init_stock_pool
 from core.gene_calculator import get_strong_stocks
+from core.runtime_lanes import (
+    freeze_challenger_profile, load_challenger_profile,
+)
 from engine.tick_processor import process_tick_data, create_whole_quote_task
 from engine.trader import run_xt_trader_task
 from engine.simulator import run_xt_trader_simulator
+from engine.simulator import paper_broker_config
+from engine.mirror import run_live_mirror
+from engine.live_archive import ArchiveCallbackGate, run_live_tick_archive
 from monitor.sector_monitor import sector_and_capitalflow_monitor_task
 from monitor.sentiment_task import market_sentiment_monitor_task_manual
 
 
 # 全局回调心跳监控器（用于监控 xtdata 回调是否正常）
 _callback_heartbeat_monitor = None
+
+
+def _new_tick_queues(count):
+    return [Queue(maxsize=max(1, 10000 // count)) for _ in range(count)]
+
+
+def _register_research_lane(task_manager, lane_name, shared_data, tick_queues,
+                            order_queue, market_queue, *, experiment_id='',
+                            ignore_portfolio_capacity=False):
+    for idx, tick_queue in enumerate(tick_queues):
+        task_manager.register_task(
+            TaskInfo(name=f'[{lane_name}] Tick数据处理进程-{idx}',
+                     target=process_tick_data,
+                     args=(shared_data, tick_queue, order_queue, True,
+                           ignore_portfolio_capacity),
+                     task_type='process', daemon=True, restart_on_failure=True,
+                     max_restart_count=5, heartbeat_timeout=60))
+    task_manager.register_task(
+        TaskInfo(name=f'[{lane_name}] 纸面交易模块',
+                 target=run_xt_trader_simulator,
+                 args=(order_queue, shared_data, True, market_queue, lane_name,
+                       experiment_id, task_manager.get_stop_event()),
+                 task_type='thread', daemon=True, restart_on_failure=False))
+
+
+def _seed_research_priority(shared_data, sector_priority):
+    target = shared_data.get('板块优先级')
+    if target is None:
+        return
+    target.clear()
+    for sector, weight in sector_priority.get('priority_sectors', {}).items():
+        target[sector] = str(weight)
 
 
 def get_callback_heartbeat_monitor(timeout: float = 30):
@@ -161,20 +202,21 @@ def main():
     # 数据队列
     # 同一股票固定路由到同一 FIFO 队列，避免多个消费者把连续 Tick
     # 乱序写入共享状态；不同股票仍可并行处理。
-    tick_queue = [
-        Queue(maxsize=10000 // TICK_PROCESSOR_COUNT)
-        for _ in range(TICK_PROCESSOR_COUNT)
-    ]
+    tick_queue = _new_tick_queues(TICK_PROCESSOR_COUNT)
     order_queue = Queue(maxsize=100)
     paper_market_queue = Queue(maxsize=64) if not IS_LIVE_TRADING else None
-
-    # 影子模式
-    shadow_tick_queue = ([
-        Queue(maxsize=10000 // SHADOW_TICK_PROCESSOR_COUNT)
-        for _ in range(SHADOW_TICK_PROCESSOR_COUNT)
-    ] if ENABLE_SHADOW_SIGNAL else None)
-    shadow_order_queue = Queue(maxsize=100) if ENABLE_SHADOW_SIGNAL else None
-    shadow_market_queue = Queue(maxsize=64) if ENABLE_SHADOW_SIGNAL else None
+    mirror_order_queue = Queue(maxsize=256) if ENABLE_MIRROR else None
+    mirror_market_queue = Queue(maxsize=64) if ENABLE_MIRROR else None
+    # The XTQuant callback and archive writer both live in this process.  A
+    # thread queue avoids multiprocessing feeder threads and gives shutdown an
+    # exact view of which accepted batches remain to be written.
+    archive_queue = ThreadQueue(maxsize=2048) if ARCHIVE_TICKS else None
+    archive_dropped_batches = Value('i', 0) if ARCHIVE_TICKS else None
+    archive_callback_gate = ArchiveCallbackGate() if ARCHIVE_TICKS else None
+    archive_producer_done = Event() if ARCHIVE_TICKS else None
+    research_tick_queues = []
+    research_market_queues = []
+    research_integrity_flags = []
 
     # 初始化 TaskManager
     task_manager = get_task_manager(stop_time=STOP_TIME)
@@ -189,6 +231,7 @@ def main():
     # Restored backups predate source-labelled event logs.  Always repair the
     # lane in memory so primary and shadow decisions cannot share an identity.
     shared_data['信号来源'] = 'primary'
+    shared_data['强势股票'] = list(strong_stocks)
 
     # U7升级：盘前 LLM 板块预判
     sector_priority = {}
@@ -210,12 +253,6 @@ def main():
                 f'回避板块: {sector_priority.get("avoid_sectors", [])}，'
                 f'影子探索候选: {len(exploration_candidates)}只'
             )
-            if not IS_LIVE_TRADING and exploration_candidates:
-                # Simulation may measure the broader discovery layer directly;
-                # every candidate still passes all real-time decision filters.
-                expanded = list(dict.fromkeys(
-                    list(shared_data['强势股票']) + exploration_candidates))
-                shared_data['强势股票'] = expanded
         except Exception as e:
             logger.warning(f'[盘前分析] 失败，策略正常运行: {e}')
 
@@ -238,7 +275,7 @@ def main():
             TaskInfo(
                 name='交易模块',
                 target=run_xt_trader_task,
-                args=(order_queue, shared_data),
+                args=(order_queue, shared_data, mirror_order_queue),
                 task_type="thread",
                 daemon=True,
                 restart_on_failure=False
@@ -248,51 +285,84 @@ def main():
         task_manager.register_task(
             TaskInfo(name='交易模块',
                      target=run_xt_trader_simulator,
-                     args=(order_queue, shared_data, False, paper_market_queue),
+                     args=(order_queue, shared_data, False, paper_market_queue,
+                           'primary_simulation', '',
+                           task_manager.get_stop_event()),
                      task_type="thread",
                      daemon=True,
                      restart_on_failure=False))
         logger.info('注册交易模块（模拟）')
 
-    # 影子模式
-    if ENABLE_SHADOW_SIGNAL:
-        logger.info('[影子模式] 开始初始化（进程数优化：4个）...')
-
-        shadow_strong_stocks = list(dict.fromkeys(
-            list(strong_stocks) + exploration_candidates))
-        shadow_shared_data = init_shared_data(stock_pool,
-                                              stock_info_dict,
-                                              shadow_strong_stocks,
-                                              PRE_TRADE_DATE,
-                                              shadow_signal_mode=True,
-                                              base_shared_data=shared_data,
-                                              new_stock_list=new_stock_list)
-        shadow_shared_data['信号来源'] = 'shadow'
-
-        shadow_process_count = SHADOW_TICK_PROCESSOR_COUNT
-        logger.info(f'[影子模式] 注册 {shadow_process_count} 个Tick数据处理进程...')
-        for idx in range(shadow_process_count):
-            task_manager.register_task(
-                TaskInfo(name=f'[影子模式] Tick数据处理进程-{idx}',
-                         target=process_tick_data,
-                         args=(shadow_shared_data, shadow_tick_queue[idx],
-                               shadow_order_queue, True),
-                         task_type="process",
-                         daemon=True,
-                         restart_on_failure=True,
-                         max_restart_count=5,
-                         heartbeat_timeout=60))
-
+    if ENABLE_MIRROR:
+        if not IS_LIVE_TRADING:
+            raise RuntimeError('Mirror 只能与实盘主通道一起运行')
         task_manager.register_task(
-            TaskInfo(name='[影子模式] 交易模块',
-                     target=run_xt_trader_simulator,
-                     args=(shadow_order_queue, shadow_shared_data, True,
-                           shadow_market_queue),
-                     task_type="thread",
-                     daemon=True,
-                     restart_on_failure=False))
+            TaskInfo(name='[live_mirror] 纸面成交校验', target=run_live_mirror,
+                     args=(mirror_order_queue, mirror_market_queue,
+                           task_manager.get_stop_event()),
+                     task_type='thread', daemon=True, restart_on_failure=False))
 
-        logger.info('[影子模式] 初始化完成')
+    def create_research_lane(lane_name, lane_stocks, *, experiment_id='',
+                             ignore_capacity=False):
+        lane_ticks = _new_tick_queues(RESEARCH_TICK_PROCESSOR_COUNT)
+        lane_orders = Queue(maxsize=256)
+        lane_market = Queue(maxsize=64)
+        lane_data = init_shared_data(
+            stock_pool, stock_info_dict, lane_stocks, PRE_TRADE_DATE,
+            shadow_signal_mode=True, base_shared_data=shared_data,
+            new_stock_list=new_stock_list, lane_name=lane_name,
+            backup_namespace=(f'{lane_name}_{experiment_id}'
+                              if experiment_id else lane_name))
+        lane_data['信号来源'] = lane_name
+        lane_data['强势股票'] = list(lane_stocks)
+        _seed_research_priority(lane_data, sector_priority)
+        research_tick_queues.append(lane_ticks)
+        research_market_queues.append(lane_market)
+        integrity_flag = Value('b', True)
+        research_integrity_flags.append(integrity_flag)
+        lane_data['研究数据完整'] = integrity_flag
+        _register_research_lane(
+            task_manager, lane_name, lane_data, lane_ticks, lane_orders,
+            lane_market, experiment_id=experiment_id,
+            ignore_portfolio_capacity=ignore_capacity)
+
+    if ENABLE_COVERAGE:
+        create_research_lane('coverage', strong_stocks, ignore_capacity=True)
+
+    if ENABLE_CHALLENGER:
+        profile = load_challenger_profile(CHALLENGER_PROFILE, EXPERIMENT_ID)
+        if (profile.include_exploration_candidates and
+                not ENABLE_PRE_MARKET_LLM_ANALYSIS):
+            raise RuntimeError(
+                '当前 Challenger 需要盘前扩展候选，但盘前分析功能未启用')
+        paper_root = os.getenv('LIMIT_UP_PAPER_DB', 'output/paper_trading')
+        if os.path.splitext(paper_root)[1]:
+            raise RuntimeError('A/B 实验要求 LIMIT_UP_PAPER_DB 配置为目录')
+        from dataclasses import asdict
+        frozen = freeze_challenger_profile(
+            profile, paper_root, asdict(paper_broker_config('baseline')))
+        logger.info(f'[实验] 配置已冻结: {frozen}')
+        # A and B use identical execution assumptions.  Only the explicitly
+        # configured candidate universe differs.
+        create_research_lane('baseline', strong_stocks,
+                             experiment_id=EXPERIMENT_ID)
+        challenger_stocks = list(strong_stocks)
+        if profile.include_exploration_candidates:
+            challenger_stocks = list(dict.fromkeys(
+                challenger_stocks + exploration_candidates))
+        create_research_lane('challenger', challenger_stocks,
+                             experiment_id=EXPERIMENT_ID)
+
+    if ARCHIVE_TICKS:
+        task_manager.register_task(
+            TaskInfo(name='Tick归档写入', target=run_live_tick_archive,
+                     args=(archive_queue, archive_dropped_batches,
+                           os.path.join('output', 'tick_archive'), TODAY),
+                     kwargs={
+                         'stop_event': task_manager.get_stop_event(),
+                         'producer_done': archive_producer_done,
+                     },
+                     task_type='thread', daemon=False, restart_on_failure=False))
 
     # 东方财富数据监控
     task_manager.register_task(
@@ -324,9 +394,13 @@ def main():
     try:
         while True:
             create_whole_quote_task(
-                stock_pool, stock_info_dict, tick_queue, shadow_tick_queue,
-                paper_market_queue, shadow_market_queue)
-            if datetime.now().time() >= STOP_TIME:
+                stock_pool, stock_info_dict, tick_queue, None,
+                paper_market_queue, None, research_tick_queues,
+                research_market_queues, mirror_market_queue, archive_queue,
+                archive_dropped_batches, archive_callback_gate,
+                research_integrity_flags, task_manager.get_stop_event())
+            if (task_manager.is_stopped() or
+                    datetime.now().time() >= STOP_TIME):
                 logger.warning('程序已到达停止时间，退出全市场行情订阅')
                 break
             else:
@@ -335,6 +409,13 @@ def main():
         logger.warning('收到 Ctrl+C 中断信号，正在退出...')
     except Exception as e:
         logger.exception(f'主循环异常退出: {e}')
+    finally:
+        if ARCHIVE_TICKS:
+            # create_whole_quote_task has cancelled the subscription before it
+            # returns.  Close admission under the callback's lock, then let the
+            # writer drain every batch it accepted before closing its manifest.
+            archive_callback_gate.close()
+            archive_producer_done.set()
 
     # 保存当日涨停列表（必须在 shutdown 之前）
     logger.info("开始保存当日涨停列表...")
@@ -357,7 +438,8 @@ def main():
     logger.info('开始运行复盘模块...')
     result = subprocess.run([
         'python', './analysis/post_market_review.py', '--date', f'{TODAY}',
-        '--strategy-version', f'{VERSION}'
+        '--strategy-version', f'{VERSION}', '--trading-mode',
+        'live' if IS_LIVE_TRADING else 'simulation'
     ],
                             capture_output=True,
                             text=True)

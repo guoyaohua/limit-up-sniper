@@ -1,6 +1,7 @@
 import time
 import traceback
 import concurrent.futures
+import re
 from multiprocessing import Value, Array, Manager
 from loguru import logger
 
@@ -14,6 +15,17 @@ from data.serialization import (load_shared_data, _batch_create_stock_signals,
 from data.sector_mapping import (load_sector_mapping,
                                  load_yesterday_first_limit_up_stock_list,
                                  load_yesterday_limit_up_stock_list)
+
+
+_SAFE_RUNTIME_NAMESPACE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
+
+
+def normalize_runtime_namespace(value, default, label):
+    """Return a filesystem-safe lane/backup token used by runtime state."""
+    normalized = str(value or default).strip().lower()
+    if not _SAFE_RUNTIME_NAMESPACE.fullmatch(normalized):
+        raise ValueError(f'无效{label}: {normalized!r}')
+    return normalized
 
 
 def print_data_summary(data):
@@ -49,7 +61,9 @@ def init_shared_data(stock_pool,
                      pre_trade_date,
                      shadow_signal_mode=False,
                      base_shared_data=None,
-                     new_stock_list=None):
+                     new_stock_list=None,
+                     lane_name='shadow',
+                     backup_namespace=None):
 
     # ---------------------------------------------------------------------------- #
     #                                      实盘                                     #
@@ -253,7 +267,11 @@ def init_shared_data(stock_pool,
     else:
         # ----------------------------------- 共享数据初始化 ----------------------------------- #
         try:
-            prefix = 'shadow_'
+            lane_name = normalize_runtime_namespace(
+                lane_name, 'shadow', '研究通道名称')
+            backup_namespace = normalize_runtime_namespace(
+                backup_namespace, lane_name, '研究备份命名空间')
+            prefix = f'{backup_namespace}_'
             # 尝试从备份文件恢复shared_data
             logger.info("[影子模式] 尝试从备份文件恢复shared_data...")
             restored_shared_data = load_shared_data(prefix=prefix)
@@ -261,6 +279,30 @@ def init_shared_data(stock_pool,
             if restored_shared_data:
                 logger.info("[影子模式] 成功从备份文件恢复shared_data")
                 shared_data = restored_shared_data
+                if base_shared_data is None:
+                    raise Exception('[研究通道] 恢复状态时缺少当前主通道共享数据')
+                # Market-wide inputs have one producer (the primary monitors).
+                # Restored proxy/value objects would otherwise stop receiving
+                # updates and silently make the restarted lane stale.
+                shared_market_fields = (
+                    '概念板块', '行业板块', '概念板块成分股',
+                    '行业板块成分股', '昨日首板股票', '昨日涨停股票',
+                    '概念板块效应', '概念板块更新时间', '行业板块效应',
+                    '行业板块更新时间', '个股资金流入',
+                    '个股资金流入更新时间', '市场情绪_涨停板数量',
+                    '市场情绪_炸板数量', '市场情绪_炸板率',
+                    '市场情绪_昨日首板连板率', '市场情绪_昨日首板连板个数',
+                    '市场情绪_昨日涨停连板率', '市场情绪_昨日涨停连板个数',
+                    '市场情绪_昨日首板表现', '市场情绪_昨日涨停表现',
+                    '上证指数涨跌幅', '沪深300涨跌幅', '创业板指涨跌幅',
+                    '深证成指涨跌幅', '市场情绪_评分', '市场情绪_更新时间',
+                )
+                for field in shared_market_fields:
+                    if field in base_shared_data:
+                        shared_data[field] = base_shared_data[field]
+                if not hasattr(shared_data.get('盘前持仓'), '_callmethod'):
+                    shared_data['盘前持仓'] = Manager().list(
+                        list(shared_data.get('盘前持仓', [])))
                 print_data_summary(shared_data)
             else:
                 logger.info("[影子模式] 未找到备份文件，创建新的shared_data")
@@ -282,6 +324,7 @@ def init_shared_data(stock_pool,
                 shadow_manager_proxy_specs = [
                     ('持仓状态', 'dict'),
                     ('委托状态', 'dict'),
+                    ('盘前持仓', 'list'),
                     ('涨停池', 'dict'),
                     ('炸板池', 'dict'),
                     ('最大开板回封时间', 'dict'),
@@ -317,11 +360,12 @@ def init_shared_data(stock_pool,
                 logger.info(f"[影子模式] Manager 代理对象创建完成，耗时 {time.time() - shadow_mgr_start:.2f}s")
 
                 shared_data = {
-                    '信号来源': 'shadow',
+                    '信号来源': lane_name,
+                    '运行通道': lane_name,
                     '股票信息': stock_info_dict,  # 股票信息字典
                     '持仓状态': shadow_manager_proxies['持仓状态'],  # 股票代码 -> 持仓状态字典JSON string
                     '委托状态': shadow_manager_proxies['委托状态'],  # 委托状态(可撤委托)，股票代码 -> 委托状态
-                    '盘前持仓': [],  # 盘前持仓列表 NOTE: 影子模式不需要
+                    '盘前持仓': shadow_manager_proxies['盘前持仓'],
                     '概念板块': base_shared_data['概念板块'],  # 股票->概念板块
                     '行业板块': base_shared_data['行业板块'],  # 股票->行业板块
                     '概念板块成分股':
@@ -377,7 +421,7 @@ def init_shared_data(stock_pool,
                     '决策原因标签': shadow_manager_proxies['决策原因标签'],  # 股票代码 -> 最近一次决策标签
                     '复盘统计计数器': shadow_manager_proxies['复盘统计计数器'],  # 统计计数器
                     '盘中事件流': shadow_manager_proxies['盘中事件流'],  # 盘中事件缓冲区
-                    '板块优先级': shadow_manager_proxies['板块优先级'],  # LLM盘前板块预判结果
+                    '板块优先级': shadow_manager_proxies['板块优先级'],  # 通道独立快照
                     '强势股票': strong_stocks,  # 强势股票列表, 涨停基因好的股票
                     '撤单次数': Value('i', 0),  # 撤单次数
                 }

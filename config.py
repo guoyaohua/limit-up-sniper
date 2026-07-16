@@ -30,14 +30,32 @@ def _env_int(name, default):
 # ---------------------------------------------------------------------------- #
 #                                     全局变量                                  #
 # ---------------------------------------------------------------------------- #
-VERSION = 'v1.0'
+VERSION = 'v1.1'
 # 安全默认值：公开仓库在未显式配置时只能运行模拟执行器。
 EXECUTION_MODE = os.getenv('LIMIT_UP_EXECUTION_MODE', 'simulation').strip().lower()
 if EXECUTION_MODE not in {'simulation', 'live'}:
     raise ValueError('LIMIT_UP_EXECUTION_MODE 只能是 simulation 或 live')
 IS_LIVE_TRADING = EXECUTION_MODE == 'live'
-DEBUG_MODE = not IS_LIVE_TRADING  # 兼容旧模块中的模式判断
-ENABLE_SHADOW_SIGNAL = _env_bool('LIMIT_UP_ENABLE_SHADOW_SIGNAL', False)
+DEBUG_MODE = _env_bool('LIMIT_UP_DEBUG_MODE', False)
+if IS_LIVE_TRADING and DEBUG_MODE:
+    raise ValueError('实盘模式禁止启用 LIMIT_UP_DEBUG_MODE')
+_LEGACY_ENABLE_SHADOW_SIGNAL = _env_bool(
+    'LIMIT_UP_ENABLE_SHADOW_SIGNAL', False)
+# Runtime lanes are deliberately named after their purpose.  The legacy
+# shadow flag remains a compatibility alias for Coverage when main.py is
+# launched directly; supported launchers always set the explicit flags.
+ENABLE_COVERAGE = _env_bool(
+    'LIMIT_UP_ENABLE_COVERAGE', _LEGACY_ENABLE_SHADOW_SIGNAL)
+ENABLE_MIRROR = _env_bool('LIMIT_UP_ENABLE_MIRROR', False)
+ARCHIVE_TICKS = _env_bool('LIMIT_UP_ARCHIVE_TICKS', False)
+CHALLENGER_PROFILE = os.getenv('LIMIT_UP_CHALLENGER_PROFILE', '').strip()
+EXPERIMENT_ID = os.getenv('LIMIT_UP_EXPERIMENT_ID', '').strip()
+if bool(CHALLENGER_PROFILE) != bool(EXPERIMENT_ID):
+    raise ValueError('Challenger 必须同时配置 profile 和 experiment id')
+ENABLE_CHALLENGER = bool(CHALLENGER_PROFILE)
+# Kept for imports in third-party extensions.  New code must use the named
+# lanes above instead of assigning another meaning to "shadow".
+ENABLE_SHADOW_SIGNAL = _LEGACY_ENABLE_SHADOW_SIGNAL
 
 # 板块数据源配置: 'THS' (同花顺) 或 'EM' (东方财富)，默认使用THS
 SECTOR_DATA_SOURCE = 'THS'
@@ -55,7 +73,11 @@ IWENCAI_HEADLESS = False
 IWENCAI_PAGE_SIZE = 100
 IWENCAI_MAX_PAGES = None
 
-STRATEGY_NAME = f'FirstLimitUp_{VERSION}_Debug' if DEBUG_MODE else f'FirstLimitUp_{VERSION}'  # 不要出现中文，以免FTP目录出现乱码
+STRATEGY_NAME = (
+    f'FirstLimitUp_{VERSION}_Debug' if DEBUG_MODE else
+    (f'FirstLimitUp_{VERSION}' if IS_LIVE_TRADING else
+     f'FirstLimitUp_{VERSION}_Simulation')
+)  # 不要出现中文，以免FTP目录出现乱码
 SHOULD_DOWNLOAD_KLINE = True
 
 # 选择交易端配置。客户端路径和资金账号属于本机敏感配置，只从环境变量读取。
@@ -107,8 +129,14 @@ MONITOR_LOG_PATH = os.path.join(
     datetime.today().strftime('%Y-%m-%d-%H%M%S'),
 )
 MONITOR_INTERVAL = 1  # 监控间隔(s)
-TICK_PROCESSOR_COUNT = 8  # 按股票代码固定分片，保证单股 Tick 严格有序
-SHADOW_TICK_PROCESSOR_COUNT = 4
+TICK_PROCESSOR_COUNT = _env_int(
+    'LIMIT_UP_TICK_PROCESSOR_COUNT', 8)  # 按股票代码固定分片，保证单股 Tick 严格有序
+RESEARCH_TICK_PROCESSOR_COUNT = _env_int(
+    'LIMIT_UP_RESEARCH_TICK_PROCESSOR_COUNT', 2)
+if TICK_PROCESSOR_COUNT <= 0 or RESEARCH_TICK_PROCESSOR_COUNT <= 0:
+    raise ValueError('Tick 处理进程数必须大于 0')
+# Deprecated compatibility name.
+SHADOW_TICK_PROCESSOR_COUNT = RESEARCH_TICK_PROCESSOR_COUNT
 STOCK_TO_CONCEPT_MAPPING_FILE = r"output\concept_sector_data\THS\stock_to_concept_mapping.json" if SECTOR_DATA_SOURCE == 'THS' else r"output\concept_sector_data\stock_to_concept_mapping.json"  # 概念板块映射文件
 STOCK_TO_INDUSTRY_MAPPING_FILE = r"output\industry_sector_data\THS\stock_to_industry_mapping.json" if SECTOR_DATA_SOURCE == 'THS' else r"output\industry_sector_data\stock_to_industry_mapping.json"  # 行业板块映射文件
 

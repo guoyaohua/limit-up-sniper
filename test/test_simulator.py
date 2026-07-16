@@ -26,6 +26,7 @@ def _shared_data() -> dict:
             }
         },
         "模拟账户": {},
+        "盘前持仓": [],
         "撤单次数": Value("i", 0),
     }
 
@@ -105,6 +106,21 @@ def test_paper_executor_rejects_buy_when_exposure_slots_are_full(monkeypatch):
     assert shared['股票状态信号']['000001.SZ']['下单状态'].value == (
         StockOrderStatusInt.NOT_ORDERED
     )
+
+
+def test_seeded_legacy_position_is_sellable_after_restart():
+    shared = _shared_data()
+    shared['持仓状态']['000001.SZ'] = json.dumps({
+        '持仓数量': 100, '可用数量': 0, '成本价': 10.0, '市值': 1_000,
+    })
+    broker = PaperBroker(BrokerConfig(initial_cash=100_000))
+
+    simulator._seed_existing_positions(broker, shared)
+    simulator._register_opening_positions(broker, shared)
+
+    assert broker.positions['000001.SZ']['available_quantity'] == 100
+    assert broker.positions['000001.SZ']['opened_date'] == '19700101'
+    assert shared['盘前持仓'] == ['000001.SZ']
 
 
 def _queued_order() -> dict:

@@ -2,6 +2,12 @@
 param(
     [ValidateSet("simulation", "live")]
     [string]$Mode = "simulation",
+    [switch]$Coverage,
+    [switch]$Mirror,
+    [string]$ChallengerProfile,
+    [string]$ExperimentId,
+    [switch]$ArchiveTicks,
+    # Compatibility only.  Shadow used to mix coverage and experiments.
     [switch]$EnableShadow,
     [switch]$RefreshSector,
     [switch]$PreflightOnly,
@@ -140,8 +146,50 @@ Import-DotEnv $EnvFile
 # CLI mode is authoritative. An accidental live value in .env cannot make the
 # default command send real orders.
 $env:LIMIT_UP_EXECUTION_MODE = $Mode
+$env:LIMIT_UP_ENABLE_COVERAGE = "false"
+$env:LIMIT_UP_ENABLE_MIRROR = "false"
+$env:LIMIT_UP_ARCHIVE_TICKS = "false"
+$env:LIMIT_UP_CHALLENGER_PROFILE = ""
+$env:LIMIT_UP_EXPERIMENT_ID = ""
+$env:LIMIT_UP_ENABLE_SHADOW_SIGNAL = "false"
+$env:LIMIT_UP_DEBUG_MODE = "false"
 if ($EnableShadow) {
-    $env:LIMIT_UP_ENABLE_SHADOW_SIGNAL = "true"
+    Write-Warning "-EnableShadow 已弃用；当前兼容解释为 -Coverage。实验策略请使用 -ChallengerProfile 和 -ExperimentId。"
+    $Coverage = $true
+}
+if ($Mirror -and $Mode -ne "live") {
+    throw "-Mirror 只能与 -Mode live 一起使用；模拟主通道本身已经是纸面账户。"
+}
+$HasProfile = -not [string]::IsNullOrWhiteSpace($ChallengerProfile)
+$HasExperimentId = -not [string]::IsNullOrWhiteSpace($ExperimentId)
+if ($HasProfile -xor $HasExperimentId) {
+    throw "Challenger 必须同时提供 -ChallengerProfile 和 -ExperimentId。"
+}
+if ($HasExperimentId -and $ExperimentId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
+    throw "ExperimentId 只能包含字母、数字、点、下划线和连字符，长度 1-64。"
+}
+if ($HasProfile) {
+    if (-not (Test-Path -LiteralPath $ChallengerProfile -PathType Leaf)) {
+        throw "Challenger 配置不存在：$ChallengerProfile"
+    }
+    $ResolvedProfile = (Resolve-Path -LiteralPath $ChallengerProfile).Path
+    Invoke-NativeCommand $VenvPython -c "import sys; from core.runtime_lanes import load_challenger_profile; load_challenger_profile(sys.argv[1], sys.argv[2]); print('Challenger 配置：有效')" $ResolvedProfile $ExperimentId
+    $env:LIMIT_UP_CHALLENGER_PROFILE = $ResolvedProfile
+    $env:LIMIT_UP_EXPERIMENT_ID = $ExperimentId
+}
+$PaperDb = [Environment]::GetEnvironmentVariable("LIMIT_UP_PAPER_DB", "Process")
+$MultiplePaperLanes = $Coverage -or $Mirror -or $HasProfile
+if ($MultiplePaperLanes -and $PaperDb -and [IO.Path]::GetExtension($PaperDb)) {
+    throw "启用 Coverage、Mirror 或 A/B 时，LIMIT_UP_PAPER_DB 必须是目录，不能是单个 SQLite 文件。"
+}
+if ($Coverage) {
+    $env:LIMIT_UP_ENABLE_COVERAGE = "true"
+}
+if ($Mirror) {
+    $env:LIMIT_UP_ENABLE_MIRROR = "true"
+}
+if ($ArchiveTicks) {
+    $env:LIMIT_UP_ARCHIVE_TICKS = "true"
 }
 
 $ClientName = [Environment]::GetEnvironmentVariable("LIMIT_UP_CLIENT_NAME", "Process")
@@ -190,7 +238,24 @@ if ($MissingSectorMappings.Count -gt 0 -and -not $RefreshSector) {
 }
 
 $ModeLabel = if ($Mode -eq "live") { "实盘" } else { "模拟" }
+$LaneLabels = @()
+if ($Coverage) { $LaneLabels += "Coverage全量信号" }
+if ($Mirror) { $LaneLabels += "Mirror实盘镜像" }
+if ($HasProfile) { $LaneLabels += "A/B实验:$ExperimentId" }
+if ($ArchiveTicks) { $LaneLabels += "Tick归档" }
+$LanePlan = if ($LaneLabels.Count) { $LaneLabels -join "、" } else { "无附加通道" }
+$PrimaryWorkersValue = [Environment]::GetEnvironmentVariable("LIMIT_UP_TICK_PROCESSOR_COUNT", "Process")
+$ResearchWorkersValue = [Environment]::GetEnvironmentVariable("LIMIT_UP_RESEARCH_TICK_PROCESSOR_COUNT", "Process")
+$PrimaryWorkers = if ($PrimaryWorkersValue) { [int]$PrimaryWorkersValue } else { 8 }
+$ResearchWorkers = if ($ResearchWorkersValue) { [int]$ResearchWorkersValue } else { 2 }
+$EstimatedWorkers = $PrimaryWorkers
+if ($Coverage) { $EstimatedWorkers += $ResearchWorkers }
+if ($HasProfile) { $EstimatedWorkers += 2 * $ResearchWorkers }
 Write-Host "启动前检查通过：模式=$ModeLabel，客户端=$ClientName，账号已配置（不回显）。" -ForegroundColor Green
+Write-Host "运行计划：主通道 + $LanePlan；预计 Tick 工作进程=$EstimatedWorkers。" -ForegroundColor Cyan
+if ($HasProfile -and $Mode -eq "live") {
+    Write-Warning "实盘同时运行 A/B 会增加资源占用；资源不足时建议仅归档 Tick，收盘后回放实验。"
+}
 if ($Mode -eq "live") {
     Write-Host "警告：下一步可能发送真实委托；main.py 仍会要求输入 yes 二次确认。" -ForegroundColor Red
 }

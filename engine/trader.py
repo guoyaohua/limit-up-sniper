@@ -10,7 +10,7 @@ import time
 import json
 import traceback
 import numpy as np
-from queue import Empty
+from queue import Empty, Full
 from threading import Thread
 from datetime import datetime
 from loguru import logger
@@ -60,7 +60,21 @@ from core.pre_market_sell import execute_pre_market_sell_strategy  # noqa: E402
 #                                  实盘交易任务                                  #
 # ---------------------------------------------------------------------------- #
 
-def run_xt_trader_task(order_queue, shared_data):
+def _publish_mirror_order(mirror_order_queue, order_req, *, quantity=None):
+    """Publish only broker-accepted production actions to the paper mirror."""
+    if mirror_order_queue is None:
+        return
+    payload = dict(order_req)
+    if quantity is not None:
+        payload['委托数量'] = int(quantity)
+    try:
+        mirror_order_queue.put_nowait(payload)
+    except Full:
+        # A research lane must never delay or reject a production order.
+        logger.critical('[live_mirror] 镜像订单队列已满；实盘继续，镜像结果标记为不完整')
+
+
+def run_xt_trader_task(order_queue, shared_data, mirror_order_queue=None):
     """
     运行交易任务，处理买入、卖出和撤单委托
 
@@ -359,6 +373,8 @@ def run_xt_trader_task(order_queue, shared_data):
                             '下单状态'].value = StockOrderStatusInt.NOT_ORDERED
                     continue
                 order_id = submission_detail
+                _publish_mirror_order(
+                    mirror_order_queue, order_req, quantity=order_volume)
 
                 # ----------------------------------- 记录日志 ----------------------------------- #
                 timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -430,6 +446,8 @@ def run_xt_trader_task(order_queue, shared_data):
                         f'原因: {order_req.get("操作原因", "")}',
                     )
                     continue
+                _publish_mirror_order(
+                    mirror_order_queue, order_req, quantity=sell_volume)
 
                 # ----------------------------------- 记录日志 ----------------------------------- #
                 timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -512,6 +530,7 @@ def run_xt_trader_task(order_queue, shared_data):
                         shared_data['股票状态信号'][stock_code][
                             '下单状态'].value = StockOrderStatusInt.CANCELLED
                     logger.info(f'更新下单状态为已撤单: {stock_code}')
+                    _publish_mirror_order(mirror_order_queue, order_req)
 
                 # ----------------------------------- 记录日志 ----------------------------------- #
                 timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")

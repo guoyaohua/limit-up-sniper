@@ -6,9 +6,12 @@
 
 | 文件 | 职责 | 运行方式 |
 |------|------|---------|
-| `tick_processor.py` | Tick 数据消费、状态更新、决策触发 | 8 个 daemon 进程 |
-| `trader.py` | 实盘下单执行 | 1 个 daemon 进程 |
-| `simulator.py` | 模拟交易（调试/影子信号） | 1 个 daemon 进程 |
+| `tick_processor.py` | Tick 分流、状态更新、决策触发 | 主通道 8 个进程；每个研究通道默认 2 个 |
+| `trader.py` | 实盘下单执行 | 1 个执行线程 |
+| `simulator.py` | 主模拟和研究通道的持久化纸面交易 | 每个启用通道 1 个线程 |
+| `paper_broker.py` | 统一费用、滑点、T+1 与盘口撮合 | 被模拟、Mirror 和回测复用 |
+| `mirror.py` | 券商已接受盘中委托的纸面镜像 | 实盘入口 1 个线程 |
+| `live_archive.py` | 复用主订阅写入 Tick 归档 | 启用归档时 1 个线程 |
 | `xt_callback.py` | XTQuant 交易回调处理 | 回调线程 |
 | `xt_queries.py` | 持仓/委托/资产查询 | 定时线程 |
 
@@ -16,16 +19,18 @@
 
 ## 二、Tick 数据处理器 (`tick_processor.py`)
 
-### 2.1 `on_data(datas, tick_queue, shadow_tick_queue, stock_info_dict, stop_flag, heartbeat_monitor)`
+### 2.1 `on_data(datas, tick_queue, ..., research_tick_queues, mirror_market_queue, archive_queue)`
 
 **角色**：XTData 行情回调函数，接收全市场 Tick 数据。
 
 **职责**：
 1. 更新心跳时间戳（标记数据源活跃）
 2. 按股票代码稳定分片到 8 个 `tick_queue`（每个队列单进程 FIFO 消费）
-3. 如果启用影子模式，同时分片到 4 个 `shadow_tick_queue`
-4. 日志记录延迟和队列大小
-5. 若延迟超过 `LATENCY_THRESHOLD`(20s) 且在交易时间内，设置 `stop_flag`
+3. 将同一批行情非阻塞分发到 Coverage、Baseline、Challenger 等研究通道
+4. 将最新行情投递给纸面账户、Mirror，并把完整批次投递给 Tick 归档线程
+5. 研究队列拥塞时不中断主通道，但标记该通道当日结果不完整
+6. 日志记录延迟和队列大小
+7. 若延迟超过 `LATENCY_THRESHOLD`(20s) 且在交易时间内，设置 `stop_flag`
 
 **Tick 数据格式**：
 ```python
@@ -48,7 +53,7 @@ datas = {
 }
 ```
 
-### 2.2 `process_tick_data(shared_data, tick_queue, order_queue, shadow_signal_mode)`
+### 2.2 `process_tick_data(shared_data, tick_queue, order_queue, research_mode, ignore_portfolio_capacity)`
 
 **角色**：Tick 消费工作进程的主循环函数。
 
@@ -114,7 +119,7 @@ if lastPrice > current_highest and stock_code in 持仓:
 
 #### Step 4: 模拟成交检查
 
-仅在 `DEBUG_MODE` 或影子信号模式下：
+在显式调试或研究通道中：
 - 调用 `check_order_successed()` 检查排板订单是否可能已成交
 - 只用下单后的累计成交量消耗排队位置，封单减少可能来自撤单，不作为成交证据
 - 必须满足“新增成交手数 ≥ 前方队列手数 + 本单手数”才确认整单成交
@@ -144,7 +149,7 @@ if should_sell(shared_data, stock_code, tick_data, ...):
 4. 买一封单减少不计入成交量，避免把其他订单撤单误判为本单成交。
 5. 开板不自动确认成交；无法取得完整、合法的队列证据时按未成交处理。
 
-### 2.4 `create_whole_quote_task(stock_pool, stock_info_dict, tick_queue, shadow_tick_queue)`
+### 2.4 `create_whole_quote_task(stock_pool, stock_info_dict, tick_queue, ..., archive_queue)`
 
 **功能**：订阅全市场行情并监控回调健康状态。
 
@@ -257,25 +262,26 @@ if order['委托类型'] == OrderType.CANCEL:
 
 ## 四、模拟交易器 (`simulator.py`)
 
-### 4.1 `run_xt_trader_simulator(order_queue, shared_data, shadow_signal_mode, market_queue)`
+### 4.1 `run_xt_trader_simulator(..., market_queue, lane, experiment_id, stop_event)`
 
 **功能**：用持久化 `PaperBroker` 消费策略委托和实时行情，不向 QMT 发送订单。
-`simulation` 模式承接主策略，`shadow` 模式使用独立的策略状态和纸面账户。
+`primary_simulation` 承接正式主策略；`coverage`、`baseline`、`challenger` 使用各自独立的
+策略状态和纸面账户。`live_mirror` 由 `mirror.py` 接收券商已接受的委托，不再运行策略。
 
 **与实盘交易器的区别**：
 
-| 项目 | 实盘 | 模拟 / 影子 |
-|------|------|-------------|
+| 项目 | 实盘 | 纸面通道 |
+|------|------|----------|
 | 资金与持仓 | QMT 真实账户 | 独立虚拟现金、持仓和可用数量 |
 | 下单 | 调用 `xt_trader.order_stock()` | 由 `PaperBroker` 撮合，不调用交易接口 |
 | 成交依据 | 交易所回报 | 五档盘口、参与率、限价和保守排队证据 |
 | 卖出 | 交易所撮合 | 支持部分卖出，并默认执行 T+1 |
 | 账本 | 券商账户 | SQLite；每次成交持久化，约每 5 秒记录净值 |
 
-纸面账户默认初始资金为 100 万元；未设置 `LIMIT_UP_PAPER_INITIAL_CASH` 时，
-独立影子账户默认使用 1000 万元。路径默认为
-`output/paper_trading/simulation.sqlite3` 和 `shadow.sqlite3`。同一 `signal_id`
-在进程重启后不会重复记账。
+主模拟默认初始资金为 100 万元；Coverage 使用技术资金上限和每信号固定目标市值，
+Baseline/Challenger 使用相同实验资金。路径默认为 `output/paper_trading/` 下按通道隔离
+的 SQLite 文件；实验账本位于 `experiments/<id>/`。同一 `signal_id` 在进程重启后不会
+重复记账。
 
 ### 4.2 成交、费用与持仓规则
 
@@ -290,7 +296,7 @@ if order['委托类型'] == OrderType.CANCEL:
 
 成交假设通过 `LIMIT_UP_PAPER_*` 环境变量配置，完整清单见
 [配置参数手册](configuration.md)；离线回测沿用相同的 `PaperBroker` 规则，见
-[Tick 回测与影子交易](backtesting.md)。
+[Tick 回测与纸面研究](backtesting.md)。
 
 ---
 

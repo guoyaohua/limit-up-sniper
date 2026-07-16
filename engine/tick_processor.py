@@ -16,7 +16,7 @@ from datetime import datetime, time as dt_time
 from loguru import logger
 
 from config import (
-    STOP_TIME, STRATEGY_NAME, DEBUG_MODE,
+    STOP_TIME, STRATEGY_NAME, IS_LIVE_TRADING,
     LATENCY_THRESHOLD,
     MAX_UP_LIMIT_BREAK_COUNT, MAX_UP_LIMIT_BREAK_TIME,
     MAX_CANCEL_COUNT,
@@ -67,7 +67,14 @@ def on_data(datas,
             stop_flag,
             heartbeat_monitor=None,
             paper_market_queue=None,
-            shadow_market_queue=None):
+            shadow_market_queue=None,
+            research_tick_queues=None,
+            research_market_queues=None,
+            mirror_market_queue=None,
+            archive_queue=None,
+            archive_dropped_batches=None,
+            archive_callback_gate=None,
+            research_integrity_flags=None):
     """分笔行情回调函数
 
     tick - 分笔数据
@@ -102,14 +109,53 @@ def on_data(datas,
         if heartbeat_monitor is not None:
             heartbeat_monitor.update()
 
+        if archive_queue is not None:
+            def enqueue_archive_batch():
+                try:
+                    archive_queue.put_nowait((time.time_ns(), dict(datas)))
+                except Full:
+                    if archive_dropped_batches is not None:
+                        with archive_dropped_batches.get_lock():
+                            archive_dropped_batches.value += 1
+
+            if archive_callback_gate is None:
+                enqueue_archive_batch()
+            else:
+                # This is deliberately the first data action in the callback.
+                # Shutdown takes the same gate before declaring the producer
+                # done, so the writer cannot close ahead of an admitted batch.
+                with archive_callback_gate:
+                    if not archive_callback_gate.accepting:
+                        # A callback arriving after unsubscribe has begun must
+                        # not reach strategy consumers without also appearing
+                        # in the archive used to reproduce those decisions.
+                        return
+                    enqueue_archive_batch()
+
         _dispatch_ticks(datas, tick_queue)
         if shadow_tick_queue:
             _dispatch_ticks(datas, shadow_tick_queue)
+        for lane_index, queues in enumerate(research_tick_queues or ()):
+            if not _dispatch_ticks_nonblocking(datas, queues):
+                integrity_flag = (
+                    research_integrity_flags[lane_index]
+                    if (research_integrity_flags and
+                        lane_index < len(research_integrity_flags))
+                    else None
+                )
+                if _mark_research_lane_incomplete(integrity_flag):
+                    logger.error(
+                        f'[研究通道-{lane_index}] Tick 队列已满；主通道继续，'
+                        '研究结果标记为不完整（本交易日不再重复告警）'
+                    )
         if paper_market_queue is not None:
             _put_latest_market(paper_market_queue, datas)
         if shadow_market_queue is not None:
             _put_latest_market(shadow_market_queue, datas)
-
+        for market_queue in research_market_queues or ():
+            _put_latest_market(market_queue, datas)
+        if mirror_market_queue is not None:
+            _put_latest_market(mirror_market_queue, datas)
         # 记录日志
         stock_code = list(datas.keys())[0]
         time_now = datetime.now().strftime('%H:%M')
@@ -157,6 +203,51 @@ def _dispatch_ticks(datas, queues):
             queues[partition].put(payload)
         return
     queues.put(datas)
+
+
+def _dispatch_ticks_nonblocking(datas, queues):
+    """Best-effort research dispatch that can never stall the quote callback."""
+    if isinstance(queues, (list, tuple)):
+        buckets = {}
+        for stock_code, tick in datas.items():
+            partition = _queue_partition(stock_code, len(queues))
+            buckets.setdefault(partition, {})[stock_code] = tick
+        # Capacity is checked for every affected partition before publishing
+        # any payload.  A half-published callback would make the research lane
+        # internally inconsistent and must never be presented as valid A/B.
+        for partition in buckets:
+            try:
+                if queues[partition].full():
+                    return False
+            except (AttributeError, NotImplementedError):
+                pass
+        for partition, payload in buckets.items():
+            try:
+                queues[partition].put_nowait(payload)
+            except Full:
+                return False
+        return True
+    try:
+        queues.put_nowait(datas)
+        return True
+    except Full:
+        return False
+
+
+def _mark_research_lane_incomplete(integrity_flag):
+    """Atomically invalidate a lane and report only its first transition."""
+    if integrity_flag is None:
+        # Compatibility callers without a shared flag still deserve an alert.
+        return True
+    lock_factory = getattr(integrity_flag, 'get_lock', None)
+    if lock_factory is None:
+        was_complete = bool(integrity_flag.value)
+        integrity_flag.value = False
+        return was_complete
+    with lock_factory():
+        was_complete = bool(integrity_flag.value)
+        integrity_flag.value = False
+        return was_complete
 
 
 def _queue_size(queues):
@@ -449,7 +540,8 @@ def _finish_break_episode(shared_data,
 def process_tick_data(shared_data,
                       tick_queue,
                       order_queue,
-                      shadow_signal_mode=False):
+                      shadow_signal_mode=False,
+                      ignore_portfolio_capacity=False):
     '''全推行情数据处理函数，分笔数据
     '''
 
@@ -805,7 +897,7 @@ def process_tick_data(shared_data,
                     # ---------------------------------------------------------------------------- #
                     #                                  模拟 - 检查是否成交                          #
                     # ---------------------------------------------------------------------------- #
-                    if (DEBUG_MODE
+                    if ((not IS_LIVE_TRADING)
                             or shadow_signal_mode) and check_order_successed(
                                 shared_data, stock_code, data, is_limit_up,
                                 strong_stocks, order_status, stock_status):
@@ -842,6 +934,7 @@ def process_tick_data(shared_data,
                                   individual_capital_inflow,
                                   cancel_count,
                                   shadow_signal_mode=shadow_signal_mode,
+                                  ignore_portfolio_capacity=ignore_portfolio_capacity,
                                   order=order):
                         # ------------------------------------ 买入 ------------------------------------ #
                         with cancel_count.get_lock():
@@ -997,7 +1090,15 @@ def create_whole_quote_task(stock_pool,
                             tick_queue,
                             shadow_tick_queue=None,
                             paper_market_queue=None,
-                            shadow_market_queue=None):
+                            shadow_market_queue=None,
+                            research_tick_queues=None,
+                            research_market_queues=None,
+                            mirror_market_queue=None,
+                            archive_queue=None,
+                            archive_dropped_batches=None,
+                            archive_callback_gate=None,
+                            research_integrity_flags=None,
+                            shutdown_event=None):
     """创建全推行情订阅任务
 
     Args:
@@ -1031,7 +1132,14 @@ def create_whole_quote_task(stock_pool,
             stop_flag=stop_flag,
             heartbeat_monitor=heartbeat_monitor,
             paper_market_queue=paper_market_queue,
-            shadow_market_queue=shadow_market_queue)
+            shadow_market_queue=shadow_market_queue,
+            research_tick_queues=research_tick_queues,
+            research_market_queues=research_market_queues,
+            mirror_market_queue=mirror_market_queue,
+            archive_queue=archive_queue,
+            archive_dropped_batches=archive_dropped_batches,
+            archive_callback_gate=archive_callback_gate,
+            research_integrity_flags=research_integrity_flags)
         while subscribe_id < 0:
             subscribe_id = xtdata.subscribe_whole_quote(
                 stock_pool, callback=partial_on_data)
@@ -1063,58 +1171,61 @@ def create_whole_quote_task(stock_pool,
         return (morning_start <= current_time <= morning_end) or (
             afternoon_start <= current_time <= afternoon_end)
 
-    while True:
-        time.sleep(1)
-        if datetime.now().time() >= STOP_TIME:
-            logger.warning(f'【进程退出】{current_process().name}')
-            return
+    try:
+        while True:
+            time.sleep(1)
+            if ((shutdown_event is not None and shutdown_event.is_set()) or
+                    datetime.now().time() >= STOP_TIME):
+                logger.warning(f'【进程退出】{current_process().name}')
+                return
 
-        # v2.4新增：检查回调心跳健康状态（每5秒检查一次，仅在交易时间内）
-        heartbeat_check_count += 1
-        if heartbeat_check_count >= 5:
-            heartbeat_check_count = 0
+            # v2.4新增：检查回调心跳健康状态（每5秒检查一次，仅在交易时间内）
+            heartbeat_check_count += 1
+            if heartbeat_check_count >= 5:
+                heartbeat_check_count = 0
 
-            # 仅在交易时间内进行心跳监控
-            if not is_callback_monitor_time():
-                logger.debug('[回调心跳] 当前不在交易时间，跳过心跳检查')
-                continue
+                # 仅在交易时间内进行心跳监控
+                if not is_callback_monitor_time():
+                    logger.debug('[回调心跳] 当前不在交易时间，跳过心跳检查')
+                    continue
 
-            # 获取当前回调次数
-            current_callback_count = heartbeat_monitor.get_callback_count()
+                # 获取当前回调次数
+                current_callback_count = heartbeat_monitor.get_callback_count()
 
-            # 检查回调是否停止（回调次数没有增加）
-            if current_callback_count == last_callback_count and last_callback_count > 0:
-                # 检查心跳是否超时
-                if heartbeat_monitor.check_and_notify():
-                    logger.critical(
-                        f'【回调异常】回调心跳超时，回调次数无变化: {current_callback_count}，'
-                        f'距离上次回调: {heartbeat_monitor.get_last_callback_age():.1f}s，'
-                        f'错误次数: {heartbeat_monitor.get_error_count()}')
-                    send_email(
-                        '【关键告警】全推行情回调异常', f'全推行情回调心跳超时，可能已停止工作。\n'
-                        f'回调次数: {current_callback_count}\n'
-                        f'距离上次回调: {heartbeat_monitor.get_last_callback_age():.1f}s\n'
-                        f'错误次数: {heartbeat_monitor.get_error_count()}\n'
-                        f'正在尝试重新订阅...')
-                    stop_flag.value = True  # 触发重新订阅
+                # 检查回调是否停止（回调次数没有增加）
+                if current_callback_count == last_callback_count and last_callback_count > 0:
+                    # 检查心跳是否超时
+                    if heartbeat_monitor.check_and_notify():
+                        logger.critical(
+                            f'【回调异常】回调心跳超时，回调次数无变化: {current_callback_count}，'
+                            f'距离上次回调: {heartbeat_monitor.get_last_callback_age():.1f}s，'
+                            f'错误次数: {heartbeat_monitor.get_error_count()}')
+                        send_email(
+                            '【关键告警】全推行情回调异常', f'全推行情回调心跳超时，可能已停止工作。\n'
+                            f'回调次数: {current_callback_count}\n'
+                            f'距离上次回调: {heartbeat_monitor.get_last_callback_age():.1f}s\n'
+                            f'错误次数: {heartbeat_monitor.get_error_count()}\n'
+                            f'正在尝试重新订阅...')
+                        stop_flag.value = True  # 触发重新订阅
 
-            last_callback_count = current_callback_count
+                last_callback_count = current_callback_count
 
-            # 每5秒输出一次心跳状态（DEBUG级别）
-            logger.debug(
-                f'[回调心跳] 回调次数: {current_callback_count}, '
-                f'距离上次回调: {heartbeat_monitor.get_last_callback_age():.1f}s, '
-                f'健康: {heartbeat_monitor.is_healthy()}')
+                # 每5秒输出一次心跳状态（DEBUG级别）
+                logger.debug(
+                    f'[回调心跳] 回调次数: {current_callback_count}, '
+                    f'距离上次回调: {heartbeat_monitor.get_last_callback_age():.1f}s, '
+                    f'健康: {heartbeat_monitor.is_healthy()}')
 
-        if stop_flag.value:
-            # 取消订阅，关闭进程，释放资源，重新订阅
-            if subscribe_id > 0:
+            if stop_flag.value:
+                # 返回主循环，由唯一调用方重新订阅，避免递归堆栈增长。
+                logger.warning(
+                    f'【进程退出】{current_process().name}，连接断开或回调异常，重新订阅')
+                return
+
+    finally:
+        if subscribe_id >= 0:
+            try:
                 xtdata.unsubscribe_quote(subscribe_id)
                 logger.warning(f'【取消订阅】【全推行情】{subscribe_id}')
-
-            # 重新订阅
-            logger.warning(f'【进程退出】{current_process().name}，连接断开或回调异常，重新订阅')
-            create_whole_quote_task(
-                stock_pool, stock_info_dict, tick_queue, shadow_tick_queue,
-                paper_market_queue, shadow_market_queue)
-            return
+            except Exception as exc:
+                logger.error(f'【取消订阅失败】【全推行情】{subscribe_id}: {exc}')

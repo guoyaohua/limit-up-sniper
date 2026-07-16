@@ -673,6 +673,7 @@ class PaperBroker:
                     "在途股份": 0,
                     "昨夜拥股": position["available_quantity"],
                     "成本价": position["average_cost"],
+                    "开仓日期": position["opened_date"],
                 },
                 ensure_ascii=False,
             )

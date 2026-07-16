@@ -67,8 +67,8 @@ Limit-Up Sniper 的核心思路是：先从全市场筛出历史股性较好的�
 - `core`：置信度至少 0.78，并且有至少两类本地证据；
 - `watch`：证据较弱或只有单一来源，仅用于继续观察。
 
-模型输出会经过本地股票代码、板块映射和证据来源复核，不能凭空创造候选。模拟模式
-可以直接测量扩展候选；实盘主策略仍使用原核心池，扩展候选只进入独立影子通道。
+模型输出会经过本地股票代码、板块映射和证据来源复核，不能凭空创造候选。正式模拟
+和实盘主策略都只使用原核心池；扩展候选只在显式 Challenger A/B 实验中进入 B 组。
 
 ### 4. 盘中确认：以下硬条件必须同时通过
 
@@ -107,7 +107,7 @@ Limit-Up Sniper 的核心思路是：先从全市场筛出历史股性较好的�
 
 ### 6. 成交不是假设：排板必须真的穿过队列
 
-模拟、影子和事件回放不会把“发出排板委托”直接记成盈利成交。只有满足：
+主模拟、研究纸面通道和事件回放都不会把“发出排板委托”直接记成盈利成交。只有满足：
 
 $$
 	ext{下单后新增累计成交手数} \geq
@@ -138,7 +138,7 @@ $$
 ## 一键部署与运行
 
 <p align="center">
-  <img src="assets/run-modes.svg" width="100%" alt="部署、模拟、影子、实盘和回测运行模式图">
+  <img src="assets/run-modes.svg" width="100%" alt="部署、主模拟、实盘、Coverage、Mirror、A/B 与回测运行模式图">
 </p>
 
 ### 前置条件
@@ -188,13 +188,26 @@ GJ_SIM_STOCK_ACCOUNT=your-account-id
 ```
 
 这是安全默认入口。即使 `.env` 中误写了 `LIMIT_UP_EXECUTION_MODE=live`，该脚本也会
-强制覆盖为 `simulation`。它会复用实时行情与完整策略，但订单只进入
-`output/paper_trading/simulation.sqlite3`。首次运行或依赖变化时会自动部署。
+强制覆盖为 `simulation`。默认同时运行正式策略纸面账户、Coverage 全量信号观察和
+Tick 归档；所有订单都不会发送到券商。主账户写入
+`output/paper_trading/primary_simulation.sqlite3`，Coverage 写入独立账本。首次运行或
+依赖变化时会自动部署。
 
-开启扩展候选影子通道：
+需要测试新策略时，使用独立的 A/B 实验入口：
 
 ```powershell
-.\scripts\run-simulation.cmd -EnableShadow
+.\scripts\run-experiment.cmd
+```
+
+实验会同时运行正式 Baseline A 和 Challenger B，并冻结配置；同一个实验编号不允许
+中途修改配置。
+需要自定义实验时，直接调用：
+
+```powershell
+.\scripts\run.ps1 -Mode simulation `
+  -ExperimentId <新编号> `
+  -ChallengerProfile <JSON路径> `
+  -ArchiveTicks
 ```
 
 首次运行或需要更新时，刷新问财板块映射并运行：
@@ -217,14 +230,9 @@ GJ_SIM_STOCK_ACCOUNT=your-account-id
 .\scripts\run-live.cmd
 ```
 
-脚本会显式设置 `live`，随后 `main.py` 还会要求输入小写 `yes`。在输入前请再次核对
-QMT 客户端、遮罩账号、策略版本和运行模式。开启影子对照可使用：
-
-```powershell
-.\scripts\run-live.cmd -EnableShadow
-```
-
-此时只有主策略发 QMT 委托；影子策略使用同一份实时 Tick 和独立纸面账户，不发实单。
+脚本会显式设置 `live`，随后 `main.py` 还会要求输入小写 `yes`。默认附带 Mirror、
+Coverage 和 Tick 归档；只有主策略发 QMT 委托。Mirror 只复制券商已经接受的实盘委托，
+不重新运行策略；Coverage 使用独立纸面账户，不发实单。
 
 ### PowerShell 完整入口
 
@@ -237,11 +245,14 @@ QMT 客户端、遮罩账号、策略版本和运行模式。开启影子对照�
 # 默认仍为 simulation
 .\scripts\run.ps1
 
-# 显式实盘 + 影子 + 刷新板块映射
-.\scripts\run.ps1 -Mode live -EnableShadow -RefreshSector
+# 仅主模拟，不启用附加通道
+.\scripts\run.ps1 -Mode simulation
+
+# 实盘 + Mirror + Coverage + Tick 归档
+.\scripts\run.ps1 -Mode live -Mirror -Coverage -ArchiveTicks -RefreshSector
 ```
 
-## Tick 保存、影子收益与回测
+## Tick 保存、纸面收益与回测
 
 ### 保存每日完整 Tick
 
@@ -255,7 +266,7 @@ QMT 客户端、遮罩账号、策略版本和运行模式。开启影子对照�
 回调批次和股票代码，并用 manifest 与 SHA-256 校验。空归档、队列丢包、后台写盘错误、
 记录数或顺序异常都会 fail closed，不能静默进入严谨回测。
 
-### 回放真实主策略或影子决策
+### 回放真实策略或研究通道决策
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\run_backtest.py `
@@ -266,20 +277,32 @@ QMT 客户端、遮罩账号、策略版本和运行模式。开启影子对照�
   --output output/backtests/primary-20260710.json
 ```
 
-将 `--event-source` 改为 `shadow` 可评估影子信号。旧事件若没有 `signal_source` 会默认
+将 `--event-source` 改为 `coverage`、`baseline` 或 `challenger` 可分别评估研究通道。
+旧版 `shadow` 仍可回放。旧事件若没有 `signal_source` 会默认
 拒绝；只有明确接受来源歧义时才加入 `--accept-legacy-unlabelled-events`。
 
 回测会输出扣费收益、最大回撤、胜率、Profit Factor、净值曲线、收盘封板率、
 排板未成交与队列失效等指标。默认下一笔同股 Tick 才允许成交，避免同 Tick 前视。
-也可以使用自定义策略插件；接口与全部参数见[Tick 回测与影子交易](docs/backtesting.md)。
+也可以使用自定义策略插件；接口与全部参数见[Tick 回测与纸面研究](docs/backtesting.md)。
 
-## 三种模式的边界
+## 运行通道的边界
 
-| 模式 | 行情 | 策略/账户 | 会发真实委托吗 |
+| 通道 | 行情 | 策略/账户 | 会发真实委托吗 |
 |---|---|---|---|
 | 实时模拟 | 实时 XTQuant | 主策略 + 持久化纸面账户 | 否 |
-| 实盘 + 可选影子 | 实时 XTQuant | 主策略发 QMT；影子状态与纸面账户独立 | 仅主策略 |
+| 实盘 + Mirror | 实时 XTQuant | 主策略发 QMT；Mirror 校验纸面成交 | 仅主策略 |
+| Coverage | 同一实时 Tick | 当前信号规则，不因资金/槽位拒绝机会 | 否 |
+| A/B 实验 | 同一实时 Tick | Baseline 与 Challenger 独立纸面账户 | 否 |
 | 离线 Tick 回测 | 已校验归档 | 回放实例 + 内存纸面账户 | 否 |
+
+当前性能版本中 Coverage 默认增加 2 个 Tick 工作者，A/B 增加 4 个；Mirror 和 Tick 归档
+只增加线程，不增加策略决策进程。启动器会打印预计工作进程数。进一步的单流水线优化
+作为后续独立版本处理。研究通道队列拥塞不会阻塞主行情回调，但当日研究结果会标记为
+不完整。
+
+Mirror 当前只镜像盘中订单队列里经券商同步接受的委托，不补造已有持仓，也不包含盘前
+卖出模块直接挂出的订单。它用于校验盘中订单撮合差异，不替代券商成交回报和完整实盘
+收益账本。
 
 事件回放验证的是“当时已记录的决策在统一撮合口径下会怎样成交”，还不是把整套实时
 策略放到历史 Tick 上重新决策。后者仍需把代码中的系统时钟统一改成事件时钟。
@@ -291,8 +314,8 @@ QMT 客户端、遮罩账号、策略版本和运行模式。开启影子对照�
 | `output/涨停基因/` | 每日全量涨停基因指标 |
 | `output/强势股票/` | 过滤与排序后的 Top 1000 候选 |
 | `output/涨停列表/` | 当日涨停、首板与炸板记录 |
-| `output/trade_logs/` | 带 `primary` / `shadow` 来源的结构化策略事件 |
-| `output/paper_trading/` | `simulation.sqlite3` 与 `shadow.sqlite3` 账本、成交和净值 |
+| `output/trade_logs/` | 带 `primary` / `coverage` / `baseline` / `challenger` 来源的事件 |
+| `output/paper_trading/` | 主模拟、Mirror、Coverage 与实验 A/B 的隔离 SQLite 账本 |
 | `output/tick_archive/` | 分段 gzip Tick、manifest 与摘要 |
 | `output/backtests/` | 回测 JSON 结果 |
 | `logs/` | 分级运行日志 |
@@ -300,7 +323,7 @@ QMT 客户端、遮罩账号、策略版本和运行模式。开启影子对照�
 ## 如何判断升级真的有效
 
 不要只看“后来涨停了多少只”。至少连续采集 20 个交易日，并让核心池 A 组与
-扩展影子池 B 组使用相同 Tick、参数、成本和撮合规则。验证窗口开始后冻结参数，至少比较：
+Challenger 扩展池 B 组使用相同 Tick、成本和撮合规则。验证窗口开始后冻结配置与撮合假设，至少比较：
 
 - 可成交信号数、未成交率、排板队列失效与撤单比例；
 - 收盘封板率及 Wilson 95% 区间、次日开盘/收盘收益；
@@ -341,7 +364,7 @@ limit-up-sniper/
 | [核心策略](docs/core-strategy.md) | 查看买入、撤单、卖出细节 |
 | [配置手册](docs/configuration.md) | 修改模式、账户、仓位和阈值 |
 | [执行引擎](docs/engine.md) | 理解 Tick 状态机与委托执行 |
-| [Tick 回测与影子交易](docs/backtesting.md) | 保存行情、模拟收益、事件回放 |
+| [Tick 回测与纸面研究](docs/backtesting.md) | 保存行情、模拟收益、事件回放 |
 | [策略升级与验证计划](docs/strategy-upgrade-2026-07-12.md) | 查看已修复问题与 A/B 验收边界 |
 
 ## 测试与安全检查

@@ -1,18 +1,20 @@
-# Tick 回测与影子交易
+# Tick 回测与纸面研究
 
-该模块使用同一个 `PaperBroker` 承担实时影子账户和离线回测撮合，避免研究阶段与
-线上模拟采用两套费用、T+1 或成交规则。它用于验证策略，不保证未来收益。
+该模块使用同一个 `PaperBroker` 承担主模拟、Mirror、Coverage、A/B 与离线回测撮合，
+避免研究阶段与线上模拟采用两套费用、T+1 或成交规则。它用于验证策略，不保证未来收益。
 
-## 三种执行模式
+## 执行角色
 
-| 模式 | 开关 | 行情 | 委托去向 |
-|------|------|------|----------|
-| 模拟 | `LIMIT_UP_EXECUTION_MODE=simulation` | 实时 XTQuant | 持久化纸面账户 |
-| 实盘 + 影子 | `live` 且 `LIMIT_UP_ENABLE_SHADOW_SIGNAL=true` | 同一份实时 Tick，独立策略状态 | 实盘发 QMT；影子只写纸面账户 |
+| 角色 | 入口/开关 | 行情 | 委托去向 |
+|------|-----------|------|----------|
+| 主模拟 + Coverage | `run-simulation.cmd` | 实时 XTQuant | 隔离持久化纸面账户 |
+| 实盘 + Mirror + Coverage | `run-live.cmd` | 同一份实时 Tick，状态与账本隔离 | 只有主策略发 QMT |
+| Baseline / Challenger | `run-experiment.cmd` | 同一份实时 Tick | 两个冻结口径的纸面账户 |
 | 离线回测 | `scripts/run_backtest.py` | Tick 归档事件回放 | 内存纸面账户 |
 
 纸面账户实时接收最新行情，更新持仓市值、浮盈和净值，并约每 5 秒写入 SQLite。
-默认文件为 `output/paper_trading/simulation.sqlite3` 和 `shadow.sqlite3`。
+默认账本为 `primary_simulation.sqlite3`、`live_mirror.sqlite3`、
+`coverage.sqlite3`，实验账本位于 `experiments/<id>/`。
 
 ## 保存 Tick
 
@@ -88,7 +90,8 @@ python scripts/run_backtest.py `
   --output output/backtests/primary-20260710.json
 ```
 
-`--event-source shadow` 可单独评估影子策略。新版事件带有 `signal_source`，默认拒绝
+`--event-source coverage|baseline|challenger` 可单独评估研究通道；`shadow` 仅兼容
+历史数据。新版事件带有 `signal_source`，默认拒绝
 无法区分主策略与影子策略的旧日志；若明确接受这一歧义，可加
 `--accept-legacy-unlabelled-events`，结果中的 `event_log_diagnostics` 会保留旧日志计数。
 由于旧事件没有实际委托数量，买入仓位由 `--event-buy-target-value` 统一指定；卖出按
@@ -114,11 +117,11 @@ python scripts/run_backtest.py `
 - `--close-at-end` 仍服从最后盘口的买盘与参与率；无买盘/跌停锁死时保留未平仓，
   不会用最新价虚构强制卖出。
 
-纸面撮合仍不能精确复原交易所排队位置。实时模拟/影子排板只接受一个保守的完整成交
+纸面撮合仍不能精确复原交易所排队位置。实时模拟和研究纸面通道的排板只接受一个保守的完整成交
 证据：下单后的累计成交手数必须覆盖“下单时前方买一队列 + 本单手数”，且确认时仍处于
 封板盘口。封单减少可能来自撤单，不计作成交；开板也不自动视为成交。该规则可能低估
 真实成交，但能避免把不可成交的涨停收益记入策略。回测仍应使用保守参与率和滑点，并
-与影子账户长期对照。
+与对应纸面账户长期对照。
 
 ## 指标口径
 

@@ -2,13 +2,14 @@ cff-version: 1.2.0
 message: "如果本项目对研究有帮助，请引用本软件仓库及所使用的数据来源。"
 title: "Limit-Up Sniper"
 type: software
+version: "1.1"
 authors:
   - family-names: "Guo"
     given-names: "Yaohua"
 repository-code: "https://github.com/guoyaohua/limit-up-sniper"
 url: "https://github.com/guoyaohua/limit-up-sniper"
 license: MIT
-abstract: "面向中国 A 股首板涨停研究的量化交易系统，支持实时信号、模拟或实盘执行、影子验证与盘后复盘。"
+abstract: "面向中国 A 股首板涨停研究的量化交易系统，支持实时信号、模拟或实盘执行、Mirror/Coverage 验证、A/B 实验与盘后复盘。"
 keywords:
   - quantitative trading
   - algorithmic trading

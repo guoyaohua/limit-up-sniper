@@ -265,6 +265,7 @@ def should_buy(shared_data,
                individual_capital_inflow=None,
                cancel_count=None,
                shadow_signal_mode=False,
+               ignore_portfolio_capacity=False,
                order={}):
     """判断是否满足买入条件
 
@@ -409,7 +410,8 @@ def should_buy(shared_data,
         # This is a fast fail-closed guard; the executor revalidates atomically
         # against the broker immediately before placing a live order.
         order_status = shared_data.get('委托状态', {})
-        if exposure_slot_count(holding_status, order_status) >= MAX_HOLDING_COUNT:
+        if (not ignore_portfolio_capacity and
+                exposure_slot_count(holding_status, order_status) >= MAX_HOLDING_COUNT):
             logger.debug(
                 f'{log_prefix}[不买入-持仓上限] {stock_code} 持仓及待成交买单已达 '
                 f'{MAX_HOLDING_COUNT} 个')
@@ -519,7 +521,8 @@ def should_buy(shared_data,
             return False
 
         # -------------------------------- 3.5 板块集中度控制 (v3.0) -------------------------------- #
-        current_holdings = list(holding_status.keys())
+        current_holdings = ([] if ignore_portfolio_capacity
+                            else list(holding_status.keys()))
         if current_holdings:
             concept_sector_mapping = shared_data.get('概念板块', {})
             stock_sectors = concept_sector_mapping.get(stock_code, [])

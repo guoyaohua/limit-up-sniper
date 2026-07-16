@@ -26,9 +26,11 @@ def init_shared_data(
     stock_info_dict,      # 每只股票的基础信息
     strong_stocks,        # 强势股列表
     pre_trade_date,       # 上一个交易日
-    shadow_signal_mode,   # 是否影子信号模式
-    base_shared_data,     # 影子模式时的基础共享数据
-    new_stock_list        # 新股列表
+    shadow_signal_mode,   # 兼容参数：是否创建研究通道状态
+    base_shared_data,     # 研究通道复用的主通道静态数据
+    new_stock_list,       # 新股列表
+    lane_name='shadow',   # coverage / baseline / challenger；shadow 仅兼容默认值
+    backup_namespace=None # 独立备份命名空间
 ) -> dict
 ```
 
@@ -206,13 +208,15 @@ with ThreadPoolExecutor(max_workers=12) as executor:
 
 **效果**：初始化时间从 ~2 分钟缩短到 10-20 秒。
 
-### 2.4 影子信号模式
+### 2.4 隔离研究通道
 
-影子信号模式下的 `init_shared_data()` 创建一个**轻量级副本**：
+Coverage、Baseline 和 Challenger 调用 `init_shared_data()` 创建**轻量级副本**。
+`shadow_signal_mode` 是内部兼容参数名，不再表示一个对外运行角色：
 
 - 股票信息、板块映射等静态数据**直接引用** `base_shared_data`（不复制）
 - 仅创建独立的状态信号、涨停池、黑名单等可变数据
-- 使用 7 个 worker 线程（vs 正常模式 12 个）
+- 每个通道拥有独立信号来源、状态备份命名空间和纸面账户
+- 使用较少的初始化 worker 线程，避免同时创建多个通道时出现瞬时资源峰值
 
 ---
 

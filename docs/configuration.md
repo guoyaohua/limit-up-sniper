@@ -7,9 +7,11 @@
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `VERSION` | str | `'v1.0'` | 策略版本号 |
-| `DEBUG_MODE` | bool | `True` | 兼容旧模块；由执行模式自动派生 |
-| `ENABLE_SHADOW_SIGNAL` | bool | `False` | 由 `LIMIT_UP_ENABLE_SHADOW_SIGNAL` 控制 |
+| `VERSION` | str | `'v1.1'` | 策略版本号 |
+| `DEBUG_MODE` | bool | `False` | 由 `LIMIT_UP_DEBUG_MODE` 显式开启；实盘禁止 |
+| `ENABLE_COVERAGE` | bool | `False` | 全量信号观察，不受资金/组合容量截断 |
+| `ENABLE_MIRROR` | bool | `False` | 实盘已接受委托的纸面镜像 |
+| `ENABLE_CHALLENGER` | bool | `False` | 提供 Challenger 配置时自动启用 A/B |
 | `IS_LIVE_TRADING` | bool | `False` | 仅当执行模式为 `live` |
 | `SECTOR_DATA_SOURCE` | str | `'THS'` | 板块数据源：`'THS'`(同花顺) 或 `'EM'`(东方财富) |
 
@@ -21,8 +23,18 @@
 |----------|--------|------|
 | `LIMIT_UP_CLIENT_NAME` | `GJ_SIM` | 客户端：`GJ_SIM` 或 `CICC_LIVE` |
 | `LIMIT_UP_EXECUTION_MODE` | `simulation` | `simulation` 使用模拟执行器；`live` 发送真实委托 |
-| `LIMIT_UP_ENABLE_SHADOW_SIGNAL` | `false` | 是否并行运行影子策略 |
-| `LIMIT_UP_PAPER_INITIAL_CASH` | `1000000` | 纸面账户初始资金；未设置时影子账户代码默认 1000 万 |
+| `LIMIT_UP_ENABLE_COVERAGE` | `false` | 是否运行全量信号观察通道 |
+| `LIMIT_UP_ENABLE_MIRROR` | `false` | 是否运行实盘纸面镜像；仅允许 live |
+| `LIMIT_UP_ARCHIVE_TICKS` | `false` | 是否复用主订阅归档 Tick |
+| `LIMIT_UP_CHALLENGER_PROFILE` | 空 | Challenger UTF-8 JSON 配置路径 |
+| `LIMIT_UP_EXPERIMENT_ID` | 空 | A/B 实验编号；与配置一起提供 |
+| `LIMIT_UP_PAPER_INITIAL_CASH` | `1000000` | 主模拟及普通纸面账户初始资金 |
+| `LIMIT_UP_COVERAGE_INITIAL_CASH` | `1000000000` | Coverage 技术资金上限；不作为可实现收益分母 |
+| `LIMIT_UP_COVERAGE_POSITION_VALUE` | `100000` | Coverage 每个信号固定目标市值 |
+| `LIMIT_UP_EXPERIMENT_INITIAL_CASH` | `1000000` | Baseline/Challenger 统一初始资金 |
+| `LIMIT_UP_LIVE_MIRROR_INITIAL_CASH` | `1000000` | Mirror 初始资金；应与实盘验证口径一致 |
+| `LIMIT_UP_TICK_PROCESSOR_COUNT` | `8` | 主通道 Tick 工作者数量 |
+| `LIMIT_UP_RESEARCH_TICK_PROCESSOR_COUNT` | `2` | 每个 Coverage/Baseline/Challenger 工作者数量 |
 | `LIMIT_UP_PAPER_COMMISSION_RATE` | `0.0003` | 双边佣金率，小数表示 |
 | `LIMIT_UP_PAPER_MIN_COMMISSION` | `5` | 每笔最低佣金（元） |
 | `LIMIT_UP_PAPER_STAMP_DUTY_RATE` | `0.0005` | 卖出印花税率，小数表示 |
@@ -30,7 +42,7 @@
 | `LIMIT_UP_PAPER_SLIPPAGE_BPS` | `2` | 纸面撮合滑点（基点） |
 | `LIMIT_UP_PAPER_PARTICIPATION_RATE` | `0.10` | 单笔最多占可见五档盘口的比例 |
 | `LIMIT_UP_PAPER_ALLOW_T0` | `false` | 是否允许当日买入当日卖出；正式验证应保持关闭 |
-| `LIMIT_UP_PAPER_DB` | `output/paper_trading` | SQLite 文件或目录；目录模式区分 simulation/shadow |
+| `LIMIT_UP_PAPER_DB` | `output/paper_trading` | SQLite 目录；多通道时禁止配置成单文件 |
 | `GJ_SIM_QMT_CLIENT_PATH` | 空 | 模拟端 `userdata_mini` 路径 |
 | `GJ_SIM_STOCK_ACCOUNT` | 空 | 模拟资金账号 |
 | `CICC_QMT_CLIENT_PATH` | 空 | 实盘端 `userdata_mini` 路径 |
@@ -40,6 +52,7 @@
 
 路径或账号为空时，`main.py` 会在连接 QMT 前立即退出并提示缺少的变量。
 `live` 模式还会在启动时要求人工输入 `yes`。
+`LIMIT_UP_ENABLE_SHADOW_SIGNAL` 仅保留为兼容别名并映射到 Coverage，新配置不要再使用。
 纸面费率均为小数，例如 `0.0003` 表示万分之三。默认撮合按五档盘口容量、
 100 股整手、滑点和 A 股 T+1 约束执行；排板还必须提供完整的队列成交证据。
 
@@ -235,7 +248,7 @@ LLM 优先板块折扣：优先板块内的股票，封单阈值额外 × 0.7。
 | `output/涨停列表/` | 每日涨停/首板/炸板列表 |
 | `output/trade_logs/{date}/` | 交易日志 JSON |
 | `output/tick_archive/{date}/` | 分段 Tick 归档、manifest 与 SHA-256 完整性信息 |
-| `output/paper_trading/` | 模拟与影子账户 SQLite 账本 |
+| `output/paper_trading/` | 主模拟、Mirror、Coverage 和实验 A/B 的隔离 SQLite 账本 |
 | `output/backtests/` | 事件回放与策略插件回测结果 JSON |
 | `output/concept_sectors/THS/` | 概念板块映射 JSON |
 | `output/industry_sectors/THS/` | 行业板块映射 JSON |

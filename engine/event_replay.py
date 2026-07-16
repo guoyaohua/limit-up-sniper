@@ -18,6 +18,9 @@ from engine.queue_fill import queued_buy_fill_progress
 
 CHINA_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 SUPPORTED_EVENT_TYPES = {"buy_decision", "cancel_decision", "sell_decision"}
+SUPPORTED_EVENT_SOURCES = {
+    "primary", "shadow", "coverage", "baseline", "challenger"
+}
 
 
 def _first(value: Any) -> Any:
@@ -66,8 +69,10 @@ def load_replay_events(
     """Load decision events, failing closed on ambiguous legacy lanes by default."""
     if isinstance(paths, (str, Path)):
         paths = [paths]
-    if source not in {"primary", "shadow"}:
-        raise ValueError("source must be primary or shadow")
+    if source not in SUPPORTED_EVENT_SOURCES:
+        raise ValueError(
+            "source must be one of " + ", ".join(sorted(SUPPORTED_EVENT_SOURCES))
+        )
     events: list[ReplayEvent] = []
     diagnostics = {
         "loaded": 0,
@@ -111,7 +116,7 @@ def load_replay_events(
                             "primary and shadow signals cannot be distinguished"
                         )
                     event_source = source
-                elif event_source not in {"primary", "shadow"}:
+                elif event_source not in SUPPORTED_EVENT_SOURCES:
                     raise ValueError(
                         f"invalid signal_source at {path}:{line_number}: "
                         f"{event_source!r}"
